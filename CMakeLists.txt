@@ -1,4 +1,5 @@
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # define build type
 IF( DEFINED CMAKE_BUILD_TYPE )
@@ -140,6 +141,28 @@ message(STATUS "Boost_INCLUDE_DIRS: ${Boost_INCLUDE_DIRS}")
 message(STATUS "Boost_LIBRARIES: ${Boost_LIBRARIES}")
 INCLUDE_DIRECTORIES (${Boost_INCLUDE_DIRS})
 
+# Highway SIMD library (optional but recommended for performance)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(HWY libhwy)
+endif()
+if(HWY_FOUND)
+  message(STATUS "Found Highway SIMD library: ${HWY_LIBRARIES}")
+  ADD_DEFINITIONS(-DUSE_HWY)
+  INCLUDE_DIRECTORIES(${HWY_INCLUDE_DIRS})
+else()
+  # Try to find Highway directly
+  find_path(HWY_INCLUDE_DIRS hwy/highway.h)
+  find_library(HWY_LIBRARIES NAMES hwy)
+  if(HWY_INCLUDE_DIRS AND HWY_LIBRARIES)
+    message(STATUS "Found Highway SIMD library: ${HWY_LIBRARIES}")
+    ADD_DEFINITIONS(-DUSE_HWY)
+    INCLUDE_DIRECTORIES(${HWY_INCLUDE_DIRS})
+  else()
+    message(STATUS "Highway SIMD library not found - Highway engine will not be available")
+  endif()
+endif()
+
 # vtk
 find_package(VTK COMPONENTS vtkCommonCore NO_MODULE QUIET)
 if ("${VTK_VERSION}" VERSION_GREATER "9")
@@ -192,6 +215,7 @@ TARGET_LINK_LIBRARIES( openEMS
   ${Boost_LIBRARIES}
   ${vtk_LIBS}
   ${MPI_LIBRARIES}
+  ${HWY_LIBRARIES}
 )
 
 if (WIN32)

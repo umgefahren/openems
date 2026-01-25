@@ -113,7 +113,7 @@ if __name__ == '__main__':
     parser.add_argument('--timesteps', type=int, default=2000,
                         help='Number of timesteps (default: 2000)')
     parser.add_argument('--engine', type=str, default='fastest',
-                        choices=['basic', 'sse', 'sse-compressed', 'multithreaded', 'fastest'],
+                        choices=['basic', 'sse', 'sse-compressed', 'multithreaded', 'fastest', 'hwy'],
                         help='Engine type (default: fastest)')
 
     args = parser.parse_args()
