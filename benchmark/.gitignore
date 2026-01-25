@@ -1,0 +1,11 @@
+# Build artifacts
+build/
+fdtd_benchmark
+fdtd_benchmark_dbg
+fdtd_benchmark_hwy
+*.o
+*.a
+
+# IDE files
+.vscode/
+.idea/
