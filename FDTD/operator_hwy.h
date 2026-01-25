@@ -18,19 +18,19 @@
 #ifndef OPERATOR_HWY_H
 #define OPERATOR_HWY_H
 
-#include "operator_sse_compressed.h"
+#include "operator_multithread.h"
 
 /**
  * @brief Operator for the Highway SIMD engine
  *
- * This operator uses the same compressed coefficient storage as
- * Operator_SSE_Compressed but creates the Highway-based engine
- * which uses wider SIMD operations (AVX2/AVX-512) when available.
+ * This operator inherits from Operator_Multithread to get the threading
+ * infrastructure, and creates the Highway-based engine which uses
+ * portable SIMD operations (AVX2/AVX-512/NEON) when available.
  */
-class Operator_Hwy : public Operator_SSE_Compressed
+class Operator_Hwy : public Operator_Multithread
 {
 public:
-	static Operator_Hwy* New();
+	static Operator_Hwy* New(unsigned int numThreads = 0);
 	virtual ~Operator_Hwy();
 
 	virtual Engine* CreateEngine() override;

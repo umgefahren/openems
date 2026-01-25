@@ -18,29 +18,30 @@
 #ifndef ENGINE_HWY_H
 #define ENGINE_HWY_H
 
-#include "engine_sse_compressed.h"
+#include "engine_multithread.h"
+
+class Operator_Hwy;
 
 /**
  * @brief High-performance FDTD engine using Google Highway for portable SIMD
  *
- * This engine extends Engine_SSE_Compressed and uses Google Highway to
- * automatically select the best available SIMD instruction set (SSE, AVX2,
+ * This engine extends Engine_Multithread (for threading) and uses Google Highway
+ * to automatically select the best available SIMD instruction set (SSE, AVX2,
  * AVX-512, NEON, etc.) at runtime.
- *
- * The data layout remains compatible with the compressed SSE operator,
- * but the update kernels use wider SIMD operations where available.
  */
-class Engine_Hwy : public Engine_SSE_Compressed
+class Engine_Hwy : public Engine_Multithread
 {
 public:
-	static Engine_Hwy* New(const Operator_SSE_Compressed* op);
+	static Engine_Hwy* New(const Operator_Hwy* op, unsigned int numThreads = 0);
 	virtual ~Engine_Hwy();
 
 protected:
-	Engine_Hwy(const Operator_SSE_Compressed* op);
+	Engine_Hwy(const Operator_Hwy* op);
 
 	virtual void UpdateVoltages(unsigned int startX, unsigned int numX) override;
 	virtual void UpdateCurrents(unsigned int startX, unsigned int numX) override;
+
+	const Operator_Hwy* m_Op_Hwy;
 };
 
 #endif // ENGINE_HWY_H

@@ -17,20 +17,20 @@
 
 #include "operator_hwy.h"
 #include "engine_hwy.h"
-#include "engine_sse.h"
 
 using std::cout;
 using std::endl;
 
-Operator_Hwy* Operator_Hwy::New()
+Operator_Hwy* Operator_Hwy::New(unsigned int numThreads)
 {
-	cout << "Create FDTD operator (Highway SIMD)" << endl;
+	cout << "Create FDTD operator (Highway SIMD + multi-threading)" << endl;
 	Operator_Hwy* op = new Operator_Hwy();
+	op->setNumThreads(numThreads);
 	op->Init();
 	return op;
 }
 
-Operator_Hwy::Operator_Hwy() : Operator_SSE_Compressed()
+Operator_Hwy::Operator_Hwy() : Operator_Multithread()
 {
 }
 
@@ -40,14 +40,6 @@ Operator_Hwy::~Operator_Hwy()
 
 Engine* Operator_Hwy::CreateEngine()
 {
-	if (!m_Use_Compression)
-	{
-		// If compression failed, fall back to basic SSE engine
-		m_Engine = Engine_sse::New(this);
-	}
-	else
-	{
-		m_Engine = Engine_Hwy::New(this);
-	}
+	m_Engine = Engine_Hwy::New(this, m_numThreads);
 	return m_Engine;
 }

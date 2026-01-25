@@ -771,7 +771,7 @@ bool openEMS::SetupOperator()
 #ifdef USE_HWY
 	else if (m_engine == EngineType_Hwy)
 	{
-		FDTD_Op = Operator_Hwy::New();
+		FDTD_Op = Operator_Hwy::New(m_engine_numThreads);
 	}
 #endif
 	else
