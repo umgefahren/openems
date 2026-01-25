@@ -20,7 +20,7 @@
 
 #include <iostream>
 
-// Highway SIMD library - use FixedTag<float, 4> to match f4vector
+// Highway SIMD library
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "FDTD/engine_hwy.cpp"
 #include <hwy/foreach_target.h>
@@ -36,9 +36,10 @@ namespace hn = hwy::HWY_NAMESPACE;
 using F32x4 = hn::FixedTag<float, 4>;
 
 /**
- * @brief Update voltages using Highway SIMD with FixedTag<float, 4>
+ * @brief Optimized voltage update using direct pointer arithmetic
+ * Eliminates linearIndex and m_Op_index calls in inner loop
  */
-void UpdateVoltagesHwy(
+HWY_ATTR void UpdateVoltagesHwy(
     f4vector* __restrict f4_volt,
     f4vector* __restrict f4_curr,
     const Operator_SSE_Compressed* Op,
@@ -51,135 +52,167 @@ void UpdateVoltagesHwy(
 {
     const F32x4 d;
 
-    unsigned int pos[3];
-    unsigned int v_pos;
-    unsigned int i_pos;
-    int i_shift[3];
+    // Pre-compute all strides once
+    const int v_stride_n = f4_volt_ptr->stride(0);  // component stride
+    const int v_stride_x = f4_volt_ptr->stride(1);  // x stride
+    const int v_stride_y = f4_volt_ptr->stride(2);  // y stride
+    const int v_stride_z = f4_volt_ptr->stride(3);  // z stride
 
-    int v_N_shift = f4_volt_ptr->stride(0);
-    int i_N_shift = f4_curr_ptr->stride(0);
-    i_shift[2] = f4_curr_ptr->stride(3);
+    const int i_stride_n = f4_curr_ptr->stride(0);
+    const int i_stride_x = f4_curr_ptr->stride(1);
+    const int i_stride_y = f4_curr_ptr->stride(2);
+    const int i_stride_z = f4_curr_ptr->stride(3);
 
-    pos[0] = startX;
-    for (unsigned int posX = 0; posX < numX; ++posX) {
-        i_shift[0] = (pos[0] > 0) * f4_curr_ptr->stride(1);
-        for (pos[1] = 0; pos[1] < numLines1; ++pos[1]) {
-            i_shift[1] = (pos[1] > 0) * f4_curr_ptr->stride(2);
+    // Get index array strides
+    const unsigned int idx_stride_x = Op->m_Op_index.stride(0);
+    const unsigned int idx_stride_y = Op->m_Op_index.stride(1);
+    const unsigned int* op_idx_data = Op->m_Op_index.data();
 
-            for (pos[2] = 1; pos[2] < numVectors; ++pos[2]) {
-                unsigned int index = Op->m_Op_index(pos[0], pos[1], pos[2]);
-                i_pos = f4_curr_ptr->linearIndex({0, pos[0], pos[1], pos[2]});
-                v_pos = f4_volt_ptr->linearIndex({0, pos[0], pos[1], pos[2]});
+    // Get pointers to compressed operators
+    const f4vector* vv0 = Op->f4_vv_Compressed[0].data();
+    const f4vector* vv1 = Op->f4_vv_Compressed[1].data();
+    const f4vector* vv2 = Op->f4_vv_Compressed[2].data();
+    const f4vector* vi0 = Op->f4_vi_Compressed[0].data();
+    const f4vector* vi1 = Op->f4_vi_Compressed[1].data();
+    const f4vector* vi2 = Op->f4_vi_Compressed[2].data();
 
-                // x-polarization
-                auto volt_x = hn::Load(d, f4_volt[v_pos].f);
-                auto vv_x = hn::Load(d, Op->f4_vv_Compressed[0][index].f);
-                auto vi_x = hn::Load(d, Op->f4_vi_Compressed[0][index].f);
+    for (unsigned int px = 0; px < numX; ++px) {
+        const unsigned int posX = startX + px;
+        const int i_shift_x = (posX > 0) ? i_stride_x : 0;
+
+        // Base positions for this X slice
+        const int volt_base_x = posX * v_stride_x;
+        const int curr_base_x = posX * i_stride_x;
+        const unsigned int idx_base_x = posX * idx_stride_x;
+
+        for (unsigned int posY = 0; posY < numLines1; ++posY) {
+            const int i_shift_y = (posY > 0) ? i_stride_y : 0;
+
+            // Base positions for this (X,Y) slice
+            const int volt_base_xy = volt_base_x + posY * v_stride_y;
+            const int curr_base_xy = curr_base_x + posY * i_stride_y;
+            const unsigned int idx_base_xy = idx_base_x + posY * idx_stride_y;
+
+            // Main loop: process z = 1 to numVectors-1
+            for (unsigned int posZ = 1; posZ < numVectors; ++posZ) {
+                const unsigned int index = op_idx_data[idx_base_xy + posZ];
+
+                // Compute direct offsets for field arrays
+                const int v_off = volt_base_xy + posZ * v_stride_z;
+                const int i_off = curr_base_xy + posZ * i_stride_z;
+
+                // x-polarization: volt = vv*volt + vi*(Hz_y+ - Hz_y- - Hy_z+ + Hy_z-)
+                auto volt_x = hn::Load(d, f4_volt[v_off].f);
+                auto vv_x = hn::Load(d, vv0[index].f);
+                auto vi_x = hn::Load(d, vi0[index].f);
 
                 auto curl = hn::Sub(
-                    hn::Load(d, f4_curr[i_pos + 2*i_N_shift].f),
-                    hn::Load(d, f4_curr[i_pos + 2*i_N_shift - i_shift[1]].f)
+                    hn::Load(d, f4_curr[i_off + 2*i_stride_n].f),
+                    hn::Load(d, f4_curr[i_off + 2*i_stride_n - i_shift_y].f)
                 );
-                curl = hn::Sub(curl, hn::Load(d, f4_curr[i_pos + i_N_shift].f));
-                curl = hn::Add(curl, hn::Load(d, f4_curr[i_pos + i_N_shift - i_shift[2]].f));
+                curl = hn::Sub(curl, hn::Load(d, f4_curr[i_off + i_stride_n].f));
+                curl = hn::Add(curl, hn::Load(d, f4_curr[i_off + i_stride_n - i_stride_z].f));
 
                 volt_x = hn::MulAdd(vi_x, curl, hn::Mul(volt_x, vv_x));
-                hn::Store(volt_x, d, f4_volt[v_pos].f);
+                hn::Store(volt_x, d, f4_volt[v_off].f);
 
                 // y-polarization
-                v_pos += v_N_shift;
-                auto volt_y = hn::Load(d, f4_volt[v_pos].f);
-                auto vv_y = hn::Load(d, Op->f4_vv_Compressed[1][index].f);
-                auto vi_y = hn::Load(d, Op->f4_vi_Compressed[1][index].f);
+                const int v_off_y = v_off + v_stride_n;
+                auto volt_y = hn::Load(d, f4_volt[v_off_y].f);
+                auto vv_y = hn::Load(d, vv1[index].f);
+                auto vi_y = hn::Load(d, vi1[index].f);
 
                 curl = hn::Sub(
-                    hn::Load(d, f4_curr[i_pos].f),
-                    hn::Load(d, f4_curr[i_pos - i_shift[2]].f)
+                    hn::Load(d, f4_curr[i_off].f),
+                    hn::Load(d, f4_curr[i_off - i_stride_z].f)
                 );
-                curl = hn::Sub(curl, hn::Load(d, f4_curr[i_pos + 2*i_N_shift].f));
-                curl = hn::Add(curl, hn::Load(d, f4_curr[i_pos + 2*i_N_shift - i_shift[0]].f));
+                curl = hn::Sub(curl, hn::Load(d, f4_curr[i_off + 2*i_stride_n].f));
+                curl = hn::Add(curl, hn::Load(d, f4_curr[i_off + 2*i_stride_n - i_shift_x].f));
 
                 volt_y = hn::MulAdd(vi_y, curl, hn::Mul(volt_y, vv_y));
-                hn::Store(volt_y, d, f4_volt[v_pos].f);
+                hn::Store(volt_y, d, f4_volt[v_off_y].f);
 
                 // z-polarization
-                v_pos += v_N_shift;
-                auto volt_z = hn::Load(d, f4_volt[v_pos].f);
-                auto vv_z = hn::Load(d, Op->f4_vv_Compressed[2][index].f);
-                auto vi_z = hn::Load(d, Op->f4_vi_Compressed[2][index].f);
+                const int v_off_z = v_off_y + v_stride_n;
+                auto volt_z = hn::Load(d, f4_volt[v_off_z].f);
+                auto vv_z = hn::Load(d, vv2[index].f);
+                auto vi_z = hn::Load(d, vi2[index].f);
 
                 curl = hn::Sub(
-                    hn::Load(d, f4_curr[i_pos + i_N_shift].f),
-                    hn::Load(d, f4_curr[i_pos + i_N_shift - i_shift[0]].f)
+                    hn::Load(d, f4_curr[i_off + i_stride_n].f),
+                    hn::Load(d, f4_curr[i_off + i_stride_n - i_shift_x].f)
                 );
-                curl = hn::Sub(curl, hn::Load(d, f4_curr[i_pos].f));
-                curl = hn::Add(curl, hn::Load(d, f4_curr[i_pos - i_shift[1]].f));
+                curl = hn::Sub(curl, hn::Load(d, f4_curr[i_off].f));
+                curl = hn::Add(curl, hn::Load(d, f4_curr[i_off - i_shift_y].f));
 
                 volt_z = hn::MulAdd(vi_z, curl, hn::Mul(volt_z, vv_z));
-                hn::Store(volt_z, d, f4_volt[v_pos].f);
+                hn::Store(volt_z, d, f4_volt[v_off_z].f);
             }
 
-            // Handle z=0 boundary
-            unsigned int i_pos_z_start = f4_curr_ptr->linearIndex({0, pos[0], pos[1], 0});
-            unsigned int i_pos_z_end = f4_curr_ptr->linearIndex({0, pos[0], pos[1], numVectors-1});
-            unsigned int index = Op->m_Op_index(pos[0], pos[1], 0);
+            // Handle z=0 boundary with wraparound
+            const unsigned int index = op_idx_data[idx_base_xy];
+            const int v_off = volt_base_xy;
+            const int i_off_start = curr_base_xy;
+            const int i_off_end = curr_base_xy + (numVectors - 1) * i_stride_z;
 
-            // Shift for boundary: insert 0 at position 0, shift others right
+            // Create shifted temp for boundary (insert 0, shift right)
             alignas(16) float temp_arr[4];
-            temp_arr[0] = 0;
-            temp_arr[1] = f4_curr[i_pos_z_end + i_N_shift].f[0];
-            temp_arr[2] = f4_curr[i_pos_z_end + i_N_shift].f[1];
-            temp_arr[3] = f4_curr[i_pos_z_end + i_N_shift].f[2];
 
-            v_pos = f4_volt_ptr->linearIndex({0, pos[0], pos[1], 0});
-            auto volt = hn::Load(d, f4_volt[v_pos].f);
-            auto vv = hn::Load(d, Op->f4_vv_Compressed[0][index].f);
-            auto vi = hn::Load(d, Op->f4_vi_Compressed[0][index].f);
+            // x-polarization at z=0
+            temp_arr[0] = 0;
+            temp_arr[1] = f4_curr[i_off_end + i_stride_n].f[0];
+            temp_arr[2] = f4_curr[i_off_end + i_stride_n].f[1];
+            temp_arr[3] = f4_curr[i_off_end + i_stride_n].f[2];
+
+            auto volt = hn::Load(d, f4_volt[v_off].f);
+            auto vv = hn::Load(d, vv0[index].f);
+            auto vi = hn::Load(d, vi0[index].f);
             auto curl = hn::Sub(
-                hn::Load(d, f4_curr[i_pos_z_start + i_N_shift*2].f),
-                hn::Load(d, f4_curr[i_pos_z_start + i_N_shift*2 - i_shift[1]].f)
+                hn::Load(d, f4_curr[i_off_start + 2*i_stride_n].f),
+                hn::Load(d, f4_curr[i_off_start + 2*i_stride_n - i_shift_y].f)
             );
-            curl = hn::Sub(curl, hn::Load(d, f4_curr[i_pos_z_start + i_N_shift].f));
+            curl = hn::Sub(curl, hn::Load(d, f4_curr[i_off_start + i_stride_n].f));
             curl = hn::Add(curl, hn::Load(d, temp_arr));
             volt = hn::MulAdd(vi, curl, hn::Mul(volt, vv));
-            hn::Store(volt, d, f4_volt[v_pos].f);
+            hn::Store(volt, d, f4_volt[v_off].f);
 
+            // y-polarization at z=0
             temp_arr[0] = 0;
-            temp_arr[1] = f4_curr[i_pos_z_end].f[0];
-            temp_arr[2] = f4_curr[i_pos_z_end].f[1];
-            temp_arr[3] = f4_curr[i_pos_z_end].f[2];
+            temp_arr[1] = f4_curr[i_off_end].f[0];
+            temp_arr[2] = f4_curr[i_off_end].f[1];
+            temp_arr[3] = f4_curr[i_off_end].f[2];
 
-            v_pos += v_N_shift;
-            volt = hn::Load(d, f4_volt[v_pos].f);
-            vv = hn::Load(d, Op->f4_vv_Compressed[1][index].f);
-            vi = hn::Load(d, Op->f4_vi_Compressed[1][index].f);
-            curl = hn::Sub(hn::Load(d, f4_curr[i_pos_z_start].f), hn::Load(d, temp_arr));
-            curl = hn::Sub(curl, hn::Load(d, f4_curr[i_pos_z_start + i_N_shift*2].f));
-            curl = hn::Add(curl, hn::Load(d, f4_curr[i_pos_z_start + i_N_shift*2 - i_shift[0]].f));
+            const int v_off_y0 = v_off + v_stride_n;
+            volt = hn::Load(d, f4_volt[v_off_y0].f);
+            vv = hn::Load(d, vv1[index].f);
+            vi = hn::Load(d, vi1[index].f);
+            curl = hn::Sub(hn::Load(d, f4_curr[i_off_start].f), hn::Load(d, temp_arr));
+            curl = hn::Sub(curl, hn::Load(d, f4_curr[i_off_start + 2*i_stride_n].f));
+            curl = hn::Add(curl, hn::Load(d, f4_curr[i_off_start + 2*i_stride_n - i_shift_x].f));
             volt = hn::MulAdd(vi, curl, hn::Mul(volt, vv));
-            hn::Store(volt, d, f4_volt[v_pos].f);
+            hn::Store(volt, d, f4_volt[v_off_y0].f);
 
-            v_pos += v_N_shift;
-            volt = hn::Load(d, f4_volt[v_pos].f);
-            vv = hn::Load(d, Op->f4_vv_Compressed[2][index].f);
-            vi = hn::Load(d, Op->f4_vi_Compressed[2][index].f);
+            // z-polarization at z=0
+            const int v_off_z0 = v_off_y0 + v_stride_n;
+            volt = hn::Load(d, f4_volt[v_off_z0].f);
+            vv = hn::Load(d, vv2[index].f);
+            vi = hn::Load(d, vi2[index].f);
             curl = hn::Sub(
-                hn::Load(d, f4_curr[i_pos_z_start + i_N_shift].f),
-                hn::Load(d, f4_curr[i_pos_z_start + i_N_shift - i_shift[0]].f)
+                hn::Load(d, f4_curr[i_off_start + i_stride_n].f),
+                hn::Load(d, f4_curr[i_off_start + i_stride_n - i_shift_x].f)
             );
-            curl = hn::Sub(curl, hn::Load(d, f4_curr[i_pos_z_start].f));
-            curl = hn::Add(curl, hn::Load(d, f4_curr[i_pos_z_start - i_shift[1]].f));
+            curl = hn::Sub(curl, hn::Load(d, f4_curr[i_off_start].f));
+            curl = hn::Add(curl, hn::Load(d, f4_curr[i_off_start - i_shift_y].f));
             volt = hn::MulAdd(vi, curl, hn::Mul(volt, vv));
-            hn::Store(volt, d, f4_volt[v_pos].f);
+            hn::Store(volt, d, f4_volt[v_off_z0].f);
         }
-        ++pos[0];
     }
 }
 
 /**
- * @brief Update currents using Highway SIMD with FixedTag<float, 4>
+ * @brief Optimized current update using direct pointer arithmetic
  */
-void UpdateCurrentsHwy(
+HWY_ATTR void UpdateCurrentsHwy(
     f4vector* __restrict f4_curr,
     f4vector* __restrict f4_volt,
     const Operator_SSE_Compressed* Op,
@@ -192,120 +225,153 @@ void UpdateCurrentsHwy(
 {
     const F32x4 d;
 
-    unsigned int v_pos;
-    unsigned int i_pos;
-    int v_shift[3];
-    unsigned int pos[3];
+    // Pre-compute all strides once
+    const int v_stride_n = f4_volt_ptr->stride(0);
+    const int v_stride_x = f4_volt_ptr->stride(1);
+    const int v_stride_y = f4_volt_ptr->stride(2);
+    const int v_stride_z = f4_volt_ptr->stride(3);
 
-    int v_N_shift = f4_volt_ptr->stride(0);
-    int i_N_shift = f4_curr_ptr->stride(0);
+    const int i_stride_n = f4_curr_ptr->stride(0);
+    const int i_stride_x = f4_curr_ptr->stride(1);
+    const int i_stride_y = f4_curr_ptr->stride(2);
+    const int i_stride_z = f4_curr_ptr->stride(3);
 
-    for (unsigned int n = 0; n < 3; ++n)
-        v_shift[n] = f4_volt_ptr->stride(n + 1);
+    // Get index array strides
+    const unsigned int idx_stride_x = Op->m_Op_index.stride(0);
+    const unsigned int idx_stride_y = Op->m_Op_index.stride(1);
+    const unsigned int* op_idx_data = Op->m_Op_index.data();
 
-    pos[0] = startX;
-    for (unsigned int posX = 0; posX < numX; ++posX) {
-        for (pos[1] = 0; pos[1] < numLines1 - 1; ++pos[1]) {
-            for (pos[2] = 0; pos[2] < numVectors - 1; ++pos[2]) {
-                unsigned int index = Op->m_Op_index(pos[0], pos[1], pos[2]);
-                i_pos = f4_curr_ptr->linearIndex({0, pos[0], pos[1], pos[2]});
-                v_pos = f4_volt_ptr->linearIndex({0, pos[0], pos[1], pos[2]});
+    // Get pointers to compressed operators
+    const f4vector* ii0 = Op->f4_ii_Compressed[0].data();
+    const f4vector* ii1 = Op->f4_ii_Compressed[1].data();
+    const f4vector* ii2 = Op->f4_ii_Compressed[2].data();
+    const f4vector* iv0 = Op->f4_iv_Compressed[0].data();
+    const f4vector* iv1 = Op->f4_iv_Compressed[1].data();
+    const f4vector* iv2 = Op->f4_iv_Compressed[2].data();
+
+    for (unsigned int px = 0; px < numX; ++px) {
+        const unsigned int posX = startX + px;
+
+        const int volt_base_x = posX * v_stride_x;
+        const int curr_base_x = posX * i_stride_x;
+        const unsigned int idx_base_x = posX * idx_stride_x;
+
+        for (unsigned int posY = 0; posY < numLines1 - 1; ++posY) {
+            const int volt_base_xy = volt_base_x + posY * v_stride_y;
+            const int curr_base_xy = curr_base_x + posY * i_stride_y;
+            const unsigned int idx_base_xy = idx_base_x + posY * idx_stride_y;
+
+            // Main loop: z = 0 to numVectors-2
+            for (unsigned int posZ = 0; posZ < numVectors - 1; ++posZ) {
+                const unsigned int index = op_idx_data[idx_base_xy + posZ];
+
+                const int v_off = volt_base_xy + posZ * v_stride_z;
+                const int i_off = curr_base_xy + posZ * i_stride_z;
 
                 // x-pol
-                auto curr = hn::Load(d, f4_curr[i_pos].f);
-                auto ii = hn::Load(d, Op->f4_ii_Compressed[0][index].f);
-                auto iv = hn::Load(d, Op->f4_iv_Compressed[0][index].f);
+                auto curr_x = hn::Load(d, f4_curr[i_off].f);
+                auto ii_x = hn::Load(d, ii0[index].f);
+                auto iv_x = hn::Load(d, iv0[index].f);
+
                 auto curl = hn::Sub(
-                    hn::Load(d, f4_volt[v_pos + 2*v_N_shift].f),
-                    hn::Load(d, f4_volt[v_pos + 2*v_N_shift + v_shift[1]].f)
+                    hn::Load(d, f4_volt[v_off + 2*v_stride_n].f),
+                    hn::Load(d, f4_volt[v_off + 2*v_stride_n + v_stride_y].f)
                 );
-                curl = hn::Sub(curl, hn::Load(d, f4_volt[v_pos + v_N_shift].f));
-                curl = hn::Add(curl, hn::Load(d, f4_volt[v_pos + v_N_shift + v_shift[2]].f));
-                curr = hn::MulAdd(iv, curl, hn::Mul(curr, ii));
-                hn::Store(curr, d, f4_curr[i_pos].f);
+                curl = hn::Sub(curl, hn::Load(d, f4_volt[v_off + v_stride_n].f));
+                curl = hn::Add(curl, hn::Load(d, f4_volt[v_off + v_stride_n + v_stride_z].f));
+
+                curr_x = hn::MulAdd(iv_x, curl, hn::Mul(curr_x, ii_x));
+                hn::Store(curr_x, d, f4_curr[i_off].f);
 
                 // y-pol
-                i_pos += i_N_shift;
-                curr = hn::Load(d, f4_curr[i_pos].f);
-                ii = hn::Load(d, Op->f4_ii_Compressed[1][index].f);
-                iv = hn::Load(d, Op->f4_iv_Compressed[1][index].f);
+                const int i_off_y = i_off + i_stride_n;
+                auto curr_y = hn::Load(d, f4_curr[i_off_y].f);
+                auto ii_y = hn::Load(d, ii1[index].f);
+                auto iv_y = hn::Load(d, iv1[index].f);
+
                 curl = hn::Sub(
-                    hn::Load(d, f4_volt[v_pos].f),
-                    hn::Load(d, f4_volt[v_pos + v_shift[2]].f)
+                    hn::Load(d, f4_volt[v_off].f),
+                    hn::Load(d, f4_volt[v_off + v_stride_z].f)
                 );
-                curl = hn::Sub(curl, hn::Load(d, f4_volt[v_pos + 2*v_N_shift].f));
-                curl = hn::Add(curl, hn::Load(d, f4_volt[v_pos + 2*v_N_shift + v_shift[0]].f));
-                curr = hn::MulAdd(iv, curl, hn::Mul(curr, ii));
-                hn::Store(curr, d, f4_curr[i_pos].f);
+                curl = hn::Sub(curl, hn::Load(d, f4_volt[v_off + 2*v_stride_n].f));
+                curl = hn::Add(curl, hn::Load(d, f4_volt[v_off + 2*v_stride_n + v_stride_x].f));
+
+                curr_y = hn::MulAdd(iv_y, curl, hn::Mul(curr_y, ii_y));
+                hn::Store(curr_y, d, f4_curr[i_off_y].f);
 
                 // z-pol
-                i_pos += i_N_shift;
-                curr = hn::Load(d, f4_curr[i_pos].f);
-                ii = hn::Load(d, Op->f4_ii_Compressed[2][index].f);
-                iv = hn::Load(d, Op->f4_iv_Compressed[2][index].f);
+                const int i_off_z = i_off_y + i_stride_n;
+                auto curr_z = hn::Load(d, f4_curr[i_off_z].f);
+                auto ii_z = hn::Load(d, ii2[index].f);
+                auto iv_z = hn::Load(d, iv2[index].f);
+
                 curl = hn::Sub(
-                    hn::Load(d, f4_volt[v_pos + v_N_shift].f),
-                    hn::Load(d, f4_volt[v_pos + v_N_shift + v_shift[0]].f)
+                    hn::Load(d, f4_volt[v_off + v_stride_n].f),
+                    hn::Load(d, f4_volt[v_off + v_stride_n + v_stride_x].f)
                 );
-                curl = hn::Sub(curl, hn::Load(d, f4_volt[v_pos].f));
-                curl = hn::Add(curl, hn::Load(d, f4_volt[v_pos + v_shift[1]].f));
-                curr = hn::MulAdd(iv, curl, hn::Mul(curr, ii));
-                hn::Store(curr, d, f4_curr[i_pos].f);
+                curl = hn::Sub(curl, hn::Load(d, f4_volt[v_off].f));
+                curl = hn::Add(curl, hn::Load(d, f4_volt[v_off + v_stride_y].f));
+
+                curr_z = hn::MulAdd(iv_z, curl, hn::Mul(curr_z, ii_z));
+                hn::Store(curr_z, d, f4_curr[i_off_z].f);
             }
 
             // Handle z=numVectors-1 boundary
-            unsigned int v_pos_z_start = f4_volt_ptr->linearIndex({0, pos[0], pos[1], 0});
-            unsigned int v_pos_z_end = f4_volt_ptr->linearIndex({0, pos[0], pos[1], numVectors-1});
-            unsigned int index = Op->m_Op_index(pos[0], pos[1], numVectors-1);
+            const unsigned int index = op_idx_data[idx_base_xy + numVectors - 1];
+            const int v_off_start = volt_base_xy;
+            const int v_off_end = volt_base_xy + (numVectors - 1) * v_stride_z;
+            const int i_off = curr_base_xy + (numVectors - 1) * i_stride_z;
 
             alignas(16) float temp_arr[4];
-            temp_arr[0] = f4_volt[v_pos_z_start + v_N_shift].f[1];
-            temp_arr[1] = f4_volt[v_pos_z_start + v_N_shift].f[2];
-            temp_arr[2] = f4_volt[v_pos_z_start + v_N_shift].f[3];
+
+            // x-pol at z=numVectors-1
+            temp_arr[0] = f4_volt[v_off_start + v_stride_n].f[1];
+            temp_arr[1] = f4_volt[v_off_start + v_stride_n].f[2];
+            temp_arr[2] = f4_volt[v_off_start + v_stride_n].f[3];
             temp_arr[3] = 0;
 
-            i_pos = f4_curr_ptr->linearIndex({0, pos[0], pos[1], numVectors-1});
-            auto curr = hn::Load(d, f4_curr[i_pos].f);
-            auto ii = hn::Load(d, Op->f4_ii_Compressed[0][index].f);
-            auto iv = hn::Load(d, Op->f4_iv_Compressed[0][index].f);
+            auto curr = hn::Load(d, f4_curr[i_off].f);
+            auto ii = hn::Load(d, ii0[index].f);
+            auto iv = hn::Load(d, iv0[index].f);
             auto curl = hn::Sub(
-                hn::Load(d, f4_volt[v_pos_z_end + 2*v_N_shift].f),
-                hn::Load(d, f4_volt[v_pos_z_end + 2*v_N_shift + v_shift[1]].f)
+                hn::Load(d, f4_volt[v_off_end + 2*v_stride_n].f),
+                hn::Load(d, f4_volt[v_off_end + 2*v_stride_n + v_stride_y].f)
             );
-            curl = hn::Sub(curl, hn::Load(d, f4_volt[v_pos_z_end + v_N_shift].f));
+            curl = hn::Sub(curl, hn::Load(d, f4_volt[v_off_end + v_stride_n].f));
             curl = hn::Add(curl, hn::Load(d, temp_arr));
             curr = hn::MulAdd(iv, curl, hn::Mul(curr, ii));
-            hn::Store(curr, d, f4_curr[i_pos].f);
+            hn::Store(curr, d, f4_curr[i_off].f);
 
-            temp_arr[0] = f4_volt[v_pos_z_start].f[1];
-            temp_arr[1] = f4_volt[v_pos_z_start].f[2];
-            temp_arr[2] = f4_volt[v_pos_z_start].f[3];
+            // y-pol at z=numVectors-1
+            temp_arr[0] = f4_volt[v_off_start].f[1];
+            temp_arr[1] = f4_volt[v_off_start].f[2];
+            temp_arr[2] = f4_volt[v_off_start].f[3];
             temp_arr[3] = 0;
 
-            i_pos += i_N_shift;
-            curr = hn::Load(d, f4_curr[i_pos].f);
-            ii = hn::Load(d, Op->f4_ii_Compressed[1][index].f);
-            iv = hn::Load(d, Op->f4_iv_Compressed[1][index].f);
-            curl = hn::Sub(hn::Load(d, f4_volt[v_pos_z_end].f), hn::Load(d, temp_arr));
-            curl = hn::Sub(curl, hn::Load(d, f4_volt[v_pos_z_end + 2*v_N_shift].f));
-            curl = hn::Add(curl, hn::Load(d, f4_volt[v_pos_z_end + 2*v_N_shift + v_shift[0]].f));
+            const int i_off_y = i_off + i_stride_n;
+            curr = hn::Load(d, f4_curr[i_off_y].f);
+            ii = hn::Load(d, ii1[index].f);
+            iv = hn::Load(d, iv1[index].f);
+            curl = hn::Sub(hn::Load(d, f4_volt[v_off_end].f), hn::Load(d, temp_arr));
+            curl = hn::Sub(curl, hn::Load(d, f4_volt[v_off_end + 2*v_stride_n].f));
+            curl = hn::Add(curl, hn::Load(d, f4_volt[v_off_end + 2*v_stride_n + v_stride_x].f));
             curr = hn::MulAdd(iv, curl, hn::Mul(curr, ii));
-            hn::Store(curr, d, f4_curr[i_pos].f);
+            hn::Store(curr, d, f4_curr[i_off_y].f);
 
-            i_pos += i_N_shift;
-            curr = hn::Load(d, f4_curr[i_pos].f);
-            ii = hn::Load(d, Op->f4_ii_Compressed[2][index].f);
-            iv = hn::Load(d, Op->f4_iv_Compressed[2][index].f);
+            // z-pol at z=numVectors-1
+            const int i_off_z = i_off_y + i_stride_n;
+            curr = hn::Load(d, f4_curr[i_off_z].f);
+            ii = hn::Load(d, ii2[index].f);
+            iv = hn::Load(d, iv2[index].f);
             curl = hn::Sub(
-                hn::Load(d, f4_volt[v_pos_z_end + v_N_shift].f),
-                hn::Load(d, f4_volt[v_pos_z_end + v_N_shift + v_shift[0]].f)
+                hn::Load(d, f4_volt[v_off_end + v_stride_n].f),
+                hn::Load(d, f4_volt[v_off_end + v_stride_n + v_stride_x].f)
             );
-            curl = hn::Sub(curl, hn::Load(d, f4_volt[v_pos_z_end].f));
-            curl = hn::Add(curl, hn::Load(d, f4_volt[v_pos_z_end + v_shift[1]].f));
+            curl = hn::Sub(curl, hn::Load(d, f4_volt[v_off_end].f));
+            curl = hn::Add(curl, hn::Load(d, f4_volt[v_off_end + v_stride_y].f));
             curr = hn::MulAdd(iv, curl, hn::Mul(curr, ii));
-            hn::Store(curr, d, f4_curr[i_pos].f);
+            hn::Store(curr, d, f4_curr[i_off_z].f);
         }
-        ++pos[0];
     }
 }
 
@@ -316,8 +382,28 @@ HWY_AFTER_NAMESPACE();
 #if HWY_ONCE
 
 namespace openEMS {
+
+// Cache function pointers for faster dispatch
+using UpdateVoltagesPtr = void (*)(f4vector*, f4vector*, const Operator_SSE_Compressed*,
+    const ArrayLib::ArrayENG<f4vector>*, const ArrayLib::ArrayENG<f4vector>*,
+    unsigned int, unsigned int, unsigned int, unsigned int);
+
+using UpdateCurrentsPtr = void (*)(f4vector*, f4vector*, const Operator_SSE_Compressed*,
+    const ArrayLib::ArrayENG<f4vector>*, const ArrayLib::ArrayENG<f4vector>*,
+    unsigned int, unsigned int, unsigned int, unsigned int);
+
 HWY_EXPORT(UpdateVoltagesHwy);
 HWY_EXPORT(UpdateCurrentsHwy);
+
+static UpdateVoltagesPtr g_UpdateVoltagesPtr = nullptr;
+static UpdateCurrentsPtr g_UpdateCurrentsPtr = nullptr;
+
+void InitFunctionPointers() {
+    if (!g_UpdateVoltagesPtr) {
+        g_UpdateVoltagesPtr = HWY_DYNAMIC_POINTER(UpdateVoltagesHwy);
+        g_UpdateCurrentsPtr = HWY_DYNAMIC_POINTER(UpdateCurrentsHwy);
+    }
+}
 
 void CallUpdateVoltagesHwy(
     f4vector* f4_volt, f4vector* f4_curr,
@@ -327,9 +413,11 @@ void CallUpdateVoltagesHwy(
     unsigned int numLines1, unsigned int numVectors,
     unsigned int startX, unsigned int numX)
 {
-    HWY_DYNAMIC_DISPATCH(UpdateVoltagesHwy)(
-        f4_volt, f4_curr, Op, f4_volt_ptr, f4_curr_ptr,
-        numLines1, numVectors, startX, numX);
+    if (HWY_UNLIKELY(!g_UpdateVoltagesPtr)) {
+        InitFunctionPointers();
+    }
+    g_UpdateVoltagesPtr(f4_volt, f4_curr, Op, f4_volt_ptr, f4_curr_ptr,
+                        numLines1, numVectors, startX, numX);
 }
 
 void CallUpdateCurrentsHwy(
@@ -340,18 +428,16 @@ void CallUpdateCurrentsHwy(
     unsigned int numLines1, unsigned int numVectors,
     unsigned int startX, unsigned int numX)
 {
-    HWY_DYNAMIC_DISPATCH(UpdateCurrentsHwy)(
-        f4_curr, f4_volt, Op, f4_volt_ptr, f4_curr_ptr,
-        numLines1, numVectors, startX, numX);
+    if (HWY_UNLIKELY(!g_UpdateCurrentsPtr)) {
+        InitFunctionPointers();
+    }
+    g_UpdateCurrentsPtr(f4_curr, f4_volt, Op, f4_volt_ptr, f4_curr_ptr,
+                        numLines1, numVectors, startX, numX);
 }
 }  // namespace openEMS
 
 using std::cout;
 using std::endl;
-
-// ============================================================================
-// Engine_Hwy Implementation - inherits threading from Engine_Multithread
-// ============================================================================
 
 Engine_Hwy* Engine_Hwy::New(const Operator_Hwy* op, unsigned int numThreads)
 {
@@ -365,6 +451,8 @@ Engine_Hwy* Engine_Hwy::New(const Operator_Hwy* op, unsigned int numThreads)
     else if (target & HWY_NEON) simd_name = "NEON";
 
     cout << "Create FDTD engine (Highway SIMD - " << simd_name << " + multi-threading)" << endl;
+
+    openEMS::InitFunctionPointers();
 
     Engine_Hwy* e = new Engine_Hwy(op);
     e->setNumThreads(numThreads);
