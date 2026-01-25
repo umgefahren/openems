@@ -31,3 +31,6 @@ python/dist
 !python/doc
 python/doc/_build
 python/doc/Tutorials/__*
+benchmark/fdtd_benchmark
+benchmark/fdtd_benchmark_all
+benchmark/fdtd_benchmark_highway
