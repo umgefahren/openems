@@ -31,3 +31,4 @@ python/dist
 !python/doc
 python/doc/_build
 python/doc/Tutorials/__*
+python/openEMS/__fallback_version__.py
