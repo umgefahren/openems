@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 project(fdtd_benchmark CXX)
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Build type
@@ -51,6 +51,22 @@ target_compile_options(fdtd_optimized PRIVATE
 # Link OpenMP if available
 if(OpenMP_CXX_FOUND)
     target_link_libraries(fdtd_optimized OpenMP::OpenMP_CXX)
+endif()
+
+# Highway library
+set(HWY_DIR "${CMAKE_SOURCE_DIR}/../third_party/highway")
+if(EXISTS ${HWY_DIR})
+    add_subdirectory(${HWY_DIR} ${CMAKE_BINARY_DIR}/highway EXCLUDE_FROM_ALL)
+
+    # Highway benchmark
+    add_executable(fdtd_highway fdtd_highway.cpp)
+    target_include_directories(fdtd_highway PRIVATE ${HWY_DIR})
+    target_link_libraries(fdtd_highway hwy)
+    target_compile_options(fdtd_highway PRIVATE -ffast-math -funroll-loops)
+
+    message(STATUS "Highway found at: ${HWY_DIR}")
+else()
+    message(STATUS "Highway not found, skipping fdtd_highway target")
 endif()
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
