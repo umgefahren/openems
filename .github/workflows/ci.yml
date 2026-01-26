@@ -311,6 +311,9 @@ jobs:
                            python3-setuptools python3-setuptools_scm \
                            python3-Cython python3-numpy python3-h5py python3-matplotlib
 
+            # Highway SIMD library (optional, for performance)
+            dnf install -y highway-devel || true
+
             # only for CI/CD test builds without networks.
             dnf install -y iproute
           elif grep -q 'ID="almalinux"' /etc/os-release; then
@@ -322,6 +325,9 @@ jobs:
                            CGAL-devel octave python3-pip \
                            python3-setuptools python3-wheel python3-setuptools_scm \
                            python3-Cython python3-numpy python3-h5py python3-matplotlib
+
+            # Highway SIMD library (optional, for performance)
+            dnf install -y highway-devel || true
 
             # only for CI/CD test builds without networks.
             dnf install -y iproute
@@ -341,6 +347,10 @@ jobs:
             apt-get install -y libvtk9-dev || \
                 apt-get install -y libvtk7-dev || \
                   apt-get install -y libvtk6-dev
+
+            # Highway SIMD library (optional, for performance)
+            # Not available on older distributions
+            apt-get install -y libhwy-dev || true
 
             # only for CI/CD test builds without networks.
             apt-get install -y iproute2
@@ -395,6 +405,9 @@ jobs:
                     python3-dev py3-pip \
                     py3-setuptools py3-setuptools_scm cython \
                     py3-numpy py3-h5py py3-matplotlib
+
+            # Highway SIMD library (optional, for performance)
+            apk add highway-dev || true
 
             # only for CI/CD test builds without networks.
             apk add iproute2
@@ -669,7 +682,7 @@ jobs:
 
           # already installed on the CI/CD system, disable to avoid warning fatigue
           # brew install python3 cmake
-          brew install boost hdf5 cgal vtk octave \
+          brew install boost hdf5 cgal vtk octave highway \
                        python-setuptools cython numpy python-matplotlib
 
           echo "export NCPUS=$(python3 -c 'import os; print(os.cpu_count())')" >> ~/.zprofile
@@ -891,6 +904,9 @@ jobs:
                                 # version. FreeBSD 14.2 uses Python 3.11 so
                                 # use "py311-"
 
+            # Highway SIMD library (optional, for performance)
+            sudo pkg install -y highway || true
+
             export CXXFLAGS="-Wall -Wextra -Wno-error"
             export NCPUS=$(python3 -c 'import os; print(os.cpu_count())')
 
@@ -1103,6 +1119,11 @@ jobs:
 
           cmake --build ./ --parallel
           cmake --install ./ --parallel 8
+
+      - name: Install Highway via vcpkg
+        run: |
+          # Highway SIMD library (optional, for performance)
+          vcpkg install highway:x64-windows-release
 
       - name: Build and install openEMS
         run: |

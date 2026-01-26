@@ -25,6 +25,9 @@
 #include "FDTD/operator_cylindermultigrid.h"
 #include "FDTD/engine_multithread.h"
 #include "FDTD/operator_multithread.h"
+#ifdef USE_HWY
+#include "FDTD/operator_hwy.h"
+#endif
 #include "FDTD/extensions/operator_ext_excitation.h"
 #include "FDTD/extensions/operator_ext_tfsf.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
@@ -259,6 +262,16 @@ openEMS::optionDesc()
 						cout << "openEMS - enabled multithreading" << endl;
 						m_engine = EngineType_Multithreaded;
 					}
+					else if (val == "hwy")
+					{
+#ifdef USE_HWY
+						cout << "openEMS - enabled Highway SIMD engine" << endl;
+						m_engine = EngineType_Hwy;
+#else
+						cerr << "openEMS - Warning: Highway engine not available, falling back to multithreaded" << endl;
+						m_engine = EngineType_Multithreaded;
+#endif
+					}
 				}
 			),
 		    "Choose engine type \n\n"
@@ -273,6 +286,7 @@ openEMS::optionDesc()
 #else
 			"operator + sse vector extensions + multithreading\n"
 #endif
+			"  hwy: \tengine using Highway SIMD\n"
 		)
 		(
 			"numThreads",
@@ -754,6 +768,12 @@ bool openEMS::SetupOperator()
 	{
 		FDTD_Op = Operator_Multithread::New(m_engine_numThreads);
 	}
+#ifdef USE_HWY
+	else if (m_engine == EngineType_Hwy)
+	{
+		FDTD_Op = Operator_Hwy::New(m_engine_numThreads);
+	}
+#endif
 	else
 	{
 		FDTD_Op = Operator::New();
