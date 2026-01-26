@@ -15,6 +15,8 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#ifdef USE_HWY
+
 #include "engine_hwy.h"
 #include "operator_hwy.h"
 
@@ -468,3 +470,5 @@ void Engine_Hwy::UpdateCurrents(unsigned int startX, unsigned int numX)
 }
 
 #endif  // HWY_ONCE
+
+#endif  // USE_HWY

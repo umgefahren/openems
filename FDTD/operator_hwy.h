@@ -18,6 +18,8 @@
 #ifndef OPERATOR_HWY_H
 #define OPERATOR_HWY_H
 
+#ifdef USE_HWY
+
 #include "operator_multithread.h"
 
 /**
@@ -38,5 +40,7 @@ public:
 protected:
 	Operator_Hwy();
 };
+
+#endif // USE_HWY
 
 #endif // OPERATOR_HWY_H

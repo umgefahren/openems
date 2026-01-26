@@ -15,6 +15,8 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#ifdef USE_HWY
+
 #include "operator_hwy.h"
 #include "engine_hwy.h"
 
@@ -43,3 +45,5 @@ Engine* Operator_Hwy::CreateEngine()
 	m_Engine = Engine_Hwy::New(this, m_numThreads);
 	return m_Engine;
 }
+
+#endif  // USE_HWY

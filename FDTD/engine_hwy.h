@@ -18,6 +18,8 @@
 #ifndef ENGINE_HWY_H
 #define ENGINE_HWY_H
 
+#ifdef USE_HWY
+
 #include "engine_multithread.h"
 
 class Operator_Hwy;
@@ -43,5 +45,7 @@ protected:
 
 	const Operator_Hwy* m_Op_Hwy;
 };
+
+#endif // USE_HWY
 
 #endif // ENGINE_HWY_H
