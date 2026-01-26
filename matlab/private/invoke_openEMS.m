@@ -27,11 +27,17 @@ filename = mfilename('fullpath');
 dir = fileparts( filename );
 
 if isunix
-    openEMS_bin = searchBinary('openEMS.sh', ...
-    {[dir filesep '..' filesep '..' filesep], ...  % try devel path
+    % Search for Rust binary 'openems' (lowercase)
+    openEMS_bin = searchBinary('openems', ...
+    {[dir filesep '..' filesep '..' filesep 'target' filesep 'release' filesep], ...  % try release build path
+     [dir filesep '..' filesep '..' filesep 'target' filesep 'debug' filesep], ...    % try debug build path
+     [dir filesep '..' filesep '..' filesep], ...  % try devel path
      [dir filesep '..' filesep '..' filesep '..' filesep '..' filesep 'bin' filesep]}); % try (default) install path
 else % assume windows
-    openEMS_bin = searchBinary('openEMS.exe', [dir filesep '..' filesep '..' filesep]);
+    openEMS_bin = searchBinary('openems.exe', ...
+    {[dir filesep '..' filesep '..' filesep 'target' filesep 'release' filesep], ...  % try release build path
+     [dir filesep '..' filesep '..' filesep 'target' filesep 'debug' filesep], ...    % try debug build path
+     [dir filesep '..' filesep '..' filesep]});
 end
 
 command = [openEMS_bin ' ' opts];
