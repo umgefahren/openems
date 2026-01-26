@@ -28,6 +28,7 @@
 #ifdef USE_HWY
 #include "FDTD/operator_hwy.h"
 #include "FDTD/operator_hwy_wide.h"
+#include "FDTD/operator_hwy_tiled.h"
 #endif
 #include "FDTD/extensions/operator_ext_excitation.h"
 #include "FDTD/extensions/operator_ext_tfsf.h"
@@ -283,6 +284,16 @@ openEMS::optionDesc()
 						m_engine = EngineType_Multithreaded;
 #endif
 					}
+					else if (val == "hwy-tiled")
+					{
+#ifdef USE_HWY
+						cout << "openEMS - enabled Highway Tiled engine (cache blocking)" << endl;
+						m_engine = EngineType_Hwy_Tiled;
+#else
+						cerr << "openEMS - Warning: Highway engine not available, falling back to multithreaded" << endl;
+						m_engine = EngineType_Multithreaded;
+#endif
+					}
 				}
 			),
 		    "Choose engine type \n\n"
@@ -299,6 +310,7 @@ openEMS::optionDesc()
 #endif
 			"  hwy: \tengine using Highway SIMD (128-bit)\n"
 			"  hwy-wide: \tengine using Highway Wide SIMD (true AVX-512)\n"
+			"  hwy-tiled: \tengine using Highway + cache tiling\n"
 		)
 		(
 			"numThreads",
@@ -788,6 +800,10 @@ bool openEMS::SetupOperator()
 	else if (m_engine == EngineType_Hwy_Wide)
 	{
 		FDTD_Op = Operator_Hwy_Wide::New(m_engine_numThreads);
+	}
+	else if (m_engine == EngineType_Hwy_Tiled)
+	{
+		FDTD_Op = Operator_Hwy_Tiled::New(m_engine_numThreads);
 	}
 #endif
 	else
