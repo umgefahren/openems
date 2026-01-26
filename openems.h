@@ -160,9 +160,9 @@ protected:
 	bool m_Abort;
 
 #ifdef MPI_SUPPORT
-	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_MPI, EngineType_Hwy};
+	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_MPI, EngineType_Hwy, EngineType_Hwy_Wide};
 #else
-	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_Hwy};
+	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_Hwy, EngineType_Hwy_Wide};
 #endif
 	EngineType m_engine;
 	unsigned int m_engine_numThreads;

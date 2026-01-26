@@ -28,5 +28,7 @@ set(SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_cylindrical_fdtd.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_hwy.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator_hwy.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine_hwy_wide.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/operator_hwy_wide.cpp
   PARENT_SCOPE
 )
