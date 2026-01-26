@@ -1,5 +1,6 @@
 use crate::arrays::{Dimensions, VectorField3D};
 use crate::fdtd::operator::Operator;
+use half::f16;
 use std::borrow::Cow;
 use wgpu::util::DeviceExt;
 
@@ -23,6 +24,10 @@ pub struct GpuEngine {
     dispatch_x: u32,
     dispatch_y: u32,
     dispatch_z: u32,
+
+    // State
+    #[allow(dead_code)]
+    supports_f16: bool,
 }
 
 impl GpuEngine {
@@ -51,19 +56,37 @@ impl GpuEngine {
         }))
         .expect("Failed to find an appropriate adapter");
 
+        // Check for f16 support
+        let features = adapter.features();
+        let supports_f16 = features.contains(wgpu::Features::SHADER_F16);
+
+        let required_features = if supports_f16 {
+            wgpu::Features::SHADER_F16
+        } else {
+            wgpu::Features::empty()
+        };
+
         let limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::Performance,
             ..Default::default()
         }))
         .expect("Failed to create device");
 
+        // Prepare shader source
+        let shader_base = include_str!("shaders.wgsl");
+        let shader_source = if supports_f16 {
+            format!("enable f16;\nalias float16 = f16;\n{}", shader_base)
+        } else {
+            format!("alias float16 = f32;\n{}", shader_base)
+        };
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FDTD Shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
         });
 
         let field_size = (total * 3 * std::mem::size_of::<f32>()) as u64;
@@ -86,43 +109,169 @@ impl GpuEngine {
             mapped_at_creation: false,
         });
 
+        // Prepare coefficients and classification
         let e_coeff = operator.e_coefficients();
         let h_coeff = operator.h_coefficients();
 
-        let mut e_coeff_data: Vec<f32> = Vec::with_capacity(total * 6);
-        for i in 0..3 {
-            e_coeff_data.extend_from_slice(e_coeff.ca[i].as_slice());
+        // Layout:
+        // coeff_f16: [ca_x, ca_y, ca_z, cb_x, cb_y, cb_z] per cell (interleaved? no, array of structs?)
+        // The shader expects arrays.
+        // Prompt shader:
+        // @group(0) @binding(2) var<storage, read> coeff_f16: array<vec4<float16>>;
+        // @group(0) @binding(3) var<storage, read> coeff_f32: array<vec4<f32>>;
+        // @group(0) @binding(4) var<storage, read> cell_class: array<u32>;
+
+        // We need to pack 6 coeffs per cell.
+        // Option 1: 2 vec4s per cell. [ca_x, ca_y, ca_z, cb_x] and [cb_y, cb_z, 0, 0].
+        // Option 2: 1 vec4 + 1 vec2 (packed? alignment issues).
+        // Let's use 2 vec4s per cell for alignment simplicity (stride 8 floats).
+
+        let mut e_coeff_f16_data: Vec<u8> = Vec::with_capacity(total * 8 * 2); // 8 halfs * 2 bytes
+        let mut e_coeff_f32_data: Vec<u8> = Vec::with_capacity(total * 8 * 4); // 8 floats * 4 bytes
+        let mut cell_class_data: Vec<u32> = Vec::with_capacity(total);
+
+        // Populate E coefficients
+        for k in 0..dims.nz {
+            for j in 0..dims.ny {
+                for i in 0..dims.nx {
+                    let ca = [
+                        e_coeff.ca[0].get(i, j, k),
+                        e_coeff.ca[1].get(i, j, k),
+                        e_coeff.ca[2].get(i, j, k),
+                    ];
+                    let cb = [
+                        e_coeff.cb[0].get(i, j, k),
+                        e_coeff.cb[1].get(i, j, k),
+                        e_coeff.cb[2].get(i, j, k),
+                    ];
+
+                    // Classify
+                    // Heuristic: Use f32 if Ca != 1.0 (lossy) and Ca != 0.0 (PEC).
+                    // Or if we implement PML later, we mark those regions.
+                    // For now: Standard = 0, HighPrecision = 1.
+                    let is_lossy = (ca[0] - 1.0).abs() > 1e-5 || (ca[0].abs() > 1e-5 && ca[0] < 0.99);
+                    let class_id = if is_lossy { 1u32 } else { 0u32 };
+                    cell_class_data.push(class_id);
+
+                    // Pack data
+                    let data_floats = [
+                        ca[0], ca[1], ca[2], cb[0],
+                        cb[1], cb[2], 0.0, 0.0
+                    ];
+
+                    // f32 buffer
+                    for &val in &data_floats {
+                        e_coeff_f32_data.extend_from_slice(bytemuck::bytes_of(&val));
+                    }
+
+                    // f16 buffer
+                    if supports_f16 {
+                        for &val in &data_floats {
+                            let val_f16 = f16::from_f32(val);
+                            e_coeff_f16_data.extend_from_slice(bytemuck::bytes_of(&val_f16));
+                        }
+                    } else {
+                        // Fallback: store f32 in "f16" buffer slot (shader alias handles type)
+                        for &val in &data_floats {
+                            e_coeff_f32_data.extend_from_slice(bytemuck::bytes_of(&val));
+                        }
+                    }
+                }
+            }
         }
-        for i in 0..3 {
-            e_coeff_data.extend_from_slice(e_coeff.cb[i].as_slice());
+        
+        // If fallback, e_coeff_f16_data is empty, we point to f32 data?
+        // No, shader expects binding 2 to exist.
+        // If !supports_f16, alias float16 = f32.
+        // So binding 2 should contain f32s.
+        if !supports_f16 {
+            e_coeff_f16_data = e_coeff_f32_data.clone();
         }
 
-        let mut h_coeff_data: Vec<f32> = Vec::with_capacity(total * 6);
-        for i in 0..3 {
-            h_coeff_data.extend_from_slice(h_coeff.da[i].as_slice());
-        }
-        for i in 0..3 {
-            h_coeff_data.extend_from_slice(h_coeff.db[i].as_slice());
-        }
-
-        let e_coeff_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("E Coeff Buffer"),
-            contents: bytemuck::cast_slice(&e_coeff_data),
+        let e_coeff_f16_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("E Coeff f16 Buffer"),
+            contents: &e_coeff_f16_data,
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let h_coeff_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("H Coeff Buffer"),
-            contents: bytemuck::cast_slice(&h_coeff_data),
+        let e_coeff_f32_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("E Coeff f32 Buffer"),
+            contents: &e_coeff_f32_data,
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        // Uniform buffer removed, constants used instead
+        // H Coefficients
+        // Similar logic, but H usually doesn't have conductivity in standard FDTD unless magnetic loss.
+        // But we follow symmetry.
+        let mut h_coeff_f16_data: Vec<u8> = Vec::with_capacity(total * 8 * 2);
+        let mut h_coeff_f32_data: Vec<u8> = Vec::with_capacity(total * 8 * 4);
+        
+        // Note: cell_class is shared? Or separate? 
+        // We reused cell_class logic for E. H might have different requirements (magnetic loss).
+        // The prompt implies a single cell_class buffer.
+        // We'll assume cell_class covers both (union of requirements).
+        // Since we already filled cell_class based on E, we might need to update it for H?
+        // But H update uses cell_class to choose H coeffs.
+        
+        for k in 0..dims.nz {
+            for j in 0..dims.ny {
+                for i in 0..dims.nx {
+                    let da = [
+                        h_coeff.da[0].get(i, j, k),
+                        h_coeff.da[1].get(i, j, k),
+                        h_coeff.da[2].get(i, j, k),
+                    ];
+                    let db = [
+                        h_coeff.db[0].get(i, j, k),
+                        h_coeff.db[1].get(i, j, k),
+                        h_coeff.db[2].get(i, j, k),
+                    ];
+                    
+                    let data_floats = [
+                        da[0], da[1], da[2], db[0],
+                        db[1], db[2], 0.0, 0.0
+                    ];
+
+                    for &val in &data_floats {
+                        h_coeff_f32_data.extend_from_slice(bytemuck::bytes_of(&val));
+                    }
+
+                    if supports_f16 {
+                        for &val in &data_floats {
+                            let val_f16 = f16::from_f32(val);
+                            h_coeff_f16_data.extend_from_slice(bytemuck::bytes_of(&val_f16));
+                        }
+                    }
+                }
+            }
+        }
+        
+        if !supports_f16 {
+            h_coeff_f16_data = h_coeff_f32_data.clone();
+        }
+
+        let h_coeff_f16_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("H Coeff f16 Buffer"),
+            contents: &h_coeff_f16_data,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let h_coeff_f32_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("H Coeff f32 Buffer"),
+            contents: &h_coeff_f32_data,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let cell_class_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Cell Class Buffer"),
+            contents: bytemuck::cast_slice(&cell_class_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("FDTD Bind Group Layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
+                wgpu::BindGroupLayoutEntry { // E Field
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -132,7 +281,7 @@ impl GpuEngine {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
+                wgpu::BindGroupLayoutEntry { // H Field
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -142,7 +291,7 @@ impl GpuEngine {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
+                wgpu::BindGroupLayoutEntry { // Coeff f16 (E)
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -152,8 +301,38 @@ impl GpuEngine {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
+                wgpu::BindGroupLayoutEntry { // Coeff f32 (E)
                     binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { // Cell Class
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { // Coeff f16 (H)
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { // Coeff f32 (H)
+                    binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -179,11 +358,23 @@ impl GpuEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: e_coeff_buffer.as_entire_binding(),
+                    resource: e_coeff_f16_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: h_coeff_buffer.as_entire_binding(),
+                    resource: e_coeff_f32_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: cell_class_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: h_coeff_f16_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: h_coeff_f32_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -225,9 +416,6 @@ impl GpuEngine {
         });
 
         // Dispatch dimensions swapped to match shader mapping:
-        // GlobalID.x -> k (fastest mem) -> dispatch_x covers nz
-        // GlobalID.y -> j -> dispatch_y covers ny
-        // GlobalID.z -> i -> dispatch_z covers nx
         let dispatch_x = (dims.nz as u32).div_ceil(64); // Workgroup size 64 along X
         let dispatch_y = (dims.ny as u32).div_ceil(2); // Workgroup size 2 along Y
         let dispatch_z = (dims.nx as u32).div_ceil(2); // Workgroup size 2 along Z
@@ -245,6 +433,7 @@ impl GpuEngine {
             dispatch_x,
             dispatch_y,
             dispatch_z,
+            supports_f16,
         }
     }
 
