@@ -29,6 +29,9 @@ mod engine;
 mod engine_compressed;
 mod engine_interface;
 mod excitation;
+/// GPU-accelerated FDTD engine implementation.
+#[cfg(feature = "gpu")]
+pub mod gpu_engine;
 mod operator;
 mod simulation;
 mod timestep;
@@ -60,6 +63,9 @@ pub enum EngineType {
     /// Compressed coefficients with memory bandwidth optimization
     /// Uses index-based lookup into small coefficient tables
     Compressed,
+    /// GPU-accelerated (WebGPU)
+    #[cfg(feature = "gpu")]
+    Gpu,
 }
 
 /// Boundary condition types

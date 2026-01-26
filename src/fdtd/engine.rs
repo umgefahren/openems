@@ -140,6 +140,10 @@ impl Engine {
                 // Fall back to parallel here to avoid breaking existing code
                 self.step_parallel(operator)
             }
+            #[cfg(feature = "gpu")]
+            EngineType::Gpu => {
+                unreachable!("GPU engine should use GpuEngine, not Engine")
+            }
         }
         self.timestep += 1;
         Ok(())
