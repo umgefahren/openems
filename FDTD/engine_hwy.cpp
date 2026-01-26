@@ -32,12 +32,16 @@ namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
 
-// Use FixedTag<float, 4> to match f4vector size (4 floats = 128 bits)
+// Use FixedTag<float, 4> for 128-bit operations (matches f4vector)
 using F32x4 = hn::FixedTag<float, 4>;
 
 /**
- * @brief Optimized voltage update using direct pointer arithmetic
- * Eliminates linearIndex and m_Op_index calls in inner loop
+ * @brief Optimized voltage update with register reuse
+ *
+ * Key optimizations:
+ * - Load current field values once and reuse across polarizations
+ * - Pre-compute all strides and base pointers
+ * - Cache operator data pointers
  */
 HWY_ATTR void UpdateVoltagesHwy(
     f4vector* __restrict f4_volt,
@@ -53,22 +57,20 @@ HWY_ATTR void UpdateVoltagesHwy(
     const F32x4 d;
 
     // Pre-compute all strides once
-    const int v_stride_n = f4_volt_ptr->stride(0);  // component stride
-    const int v_stride_x = f4_volt_ptr->stride(1);  // x stride
-    const int v_stride_y = f4_volt_ptr->stride(2);  // y stride
-    const int v_stride_z = f4_volt_ptr->stride(3);  // z stride
+    const int v_stride_n = f4_volt_ptr->stride(0);
+    const int v_stride_x = f4_volt_ptr->stride(1);
+    const int v_stride_y = f4_volt_ptr->stride(2);
+    const int v_stride_z = f4_volt_ptr->stride(3);
 
     const int i_stride_n = f4_curr_ptr->stride(0);
     const int i_stride_x = f4_curr_ptr->stride(1);
     const int i_stride_y = f4_curr_ptr->stride(2);
     const int i_stride_z = f4_curr_ptr->stride(3);
 
-    // Get index array strides
     const unsigned int idx_stride_x = Op->m_Op_index.stride(0);
     const unsigned int idx_stride_y = Op->m_Op_index.stride(1);
     const unsigned int* op_idx_data = Op->m_Op_index.data();
 
-    // Get pointers to compressed operators
     const f4vector* vv0 = Op->f4_vv_Compressed[0].data();
     const f4vector* vv1 = Op->f4_vv_Compressed[1].data();
     const f4vector* vv2 = Op->f4_vv_Compressed[2].data();
@@ -80,7 +82,6 @@ HWY_ATTR void UpdateVoltagesHwy(
         const unsigned int posX = startX + px;
         const int i_shift_x = (posX > 0) ? i_stride_x : 0;
 
-        // Base positions for this X slice
         const int volt_base_x = posX * v_stride_x;
         const int curr_base_x = posX * i_stride_x;
         const unsigned int idx_base_x = posX * idx_stride_x;
@@ -88,74 +89,66 @@ HWY_ATTR void UpdateVoltagesHwy(
         for (unsigned int posY = 0; posY < numLines1; ++posY) {
             const int i_shift_y = (posY > 0) ? i_stride_y : 0;
 
-            // Base positions for this (X,Y) slice
             const int volt_base_xy = volt_base_x + posY * v_stride_y;
             const int curr_base_xy = curr_base_x + posY * i_stride_y;
             const unsigned int idx_base_xy = idx_base_x + posY * idx_stride_y;
 
-            // Main loop: process z = 1 to numVectors-1
+            // Main loop - process z from 1 to numVectors-1
             for (unsigned int posZ = 1; posZ < numVectors; ++posZ) {
                 const unsigned int index = op_idx_data[idx_base_xy + posZ];
-
-                // Compute direct offsets for field arrays
                 const int v_off = volt_base_xy + posZ * v_stride_z;
                 const int i_off = curr_base_xy + posZ * i_stride_z;
 
-                // x-polarization: volt = vv*volt + vi*(Hz_y+ - Hz_y- - Hy_z+ + Hy_z-)
+                // Load current field values ONCE and reuse across polarizations
+                const auto curr_hx = hn::Load(d, f4_curr[i_off].f);
+                const auto curr_hy = hn::Load(d, f4_curr[i_off + i_stride_n].f);
+                const auto curr_hz = hn::Load(d, f4_curr[i_off + 2*i_stride_n].f);
+
+                // x-polarization: curl = Hz(y) - Hz(y-1) - Hy(z) + Hy(z-1)
                 auto volt_x = hn::Load(d, f4_volt[v_off].f);
                 auto vv_x = hn::Load(d, vv0[index].f);
                 auto vi_x = hn::Load(d, vi0[index].f);
 
-                auto curl = hn::Sub(
-                    hn::Load(d, f4_curr[i_off + 2*i_stride_n].f),
-                    hn::Load(d, f4_curr[i_off + 2*i_stride_n - i_shift_y].f)
-                );
-                curl = hn::Sub(curl, hn::Load(d, f4_curr[i_off + i_stride_n].f));
-                curl = hn::Add(curl, hn::Load(d, f4_curr[i_off + i_stride_n - i_stride_z].f));
+                auto curl_x = hn::Sub(curr_hz, hn::Load(d, f4_curr[i_off + 2*i_stride_n - i_shift_y].f));
+                curl_x = hn::Sub(curl_x, curr_hy);
+                curl_x = hn::Add(curl_x, hn::Load(d, f4_curr[i_off + i_stride_n - i_stride_z].f));
 
-                volt_x = hn::MulAdd(vi_x, curl, hn::Mul(volt_x, vv_x));
+                volt_x = hn::MulAdd(vi_x, curl_x, hn::Mul(volt_x, vv_x));
                 hn::Store(volt_x, d, f4_volt[v_off].f);
 
-                // y-polarization
+                // y-polarization: curl = Hx(z) - Hx(z-1) - Hz(x) + Hz(x-1)
                 const int v_off_y = v_off + v_stride_n;
                 auto volt_y = hn::Load(d, f4_volt[v_off_y].f);
                 auto vv_y = hn::Load(d, vv1[index].f);
                 auto vi_y = hn::Load(d, vi1[index].f);
 
-                curl = hn::Sub(
-                    hn::Load(d, f4_curr[i_off].f),
-                    hn::Load(d, f4_curr[i_off - i_stride_z].f)
-                );
-                curl = hn::Sub(curl, hn::Load(d, f4_curr[i_off + 2*i_stride_n].f));
-                curl = hn::Add(curl, hn::Load(d, f4_curr[i_off + 2*i_stride_n - i_shift_x].f));
+                auto curl_y = hn::Sub(curr_hx, hn::Load(d, f4_curr[i_off - i_stride_z].f));
+                curl_y = hn::Sub(curl_y, curr_hz);
+                curl_y = hn::Add(curl_y, hn::Load(d, f4_curr[i_off + 2*i_stride_n - i_shift_x].f));
 
-                volt_y = hn::MulAdd(vi_y, curl, hn::Mul(volt_y, vv_y));
+                volt_y = hn::MulAdd(vi_y, curl_y, hn::Mul(volt_y, vv_y));
                 hn::Store(volt_y, d, f4_volt[v_off_y].f);
 
-                // z-polarization
+                // z-polarization: curl = Hy(x) - Hy(x-1) - Hx(y) + Hx(y-1)
                 const int v_off_z = v_off_y + v_stride_n;
                 auto volt_z = hn::Load(d, f4_volt[v_off_z].f);
                 auto vv_z = hn::Load(d, vv2[index].f);
                 auto vi_z = hn::Load(d, vi2[index].f);
 
-                curl = hn::Sub(
-                    hn::Load(d, f4_curr[i_off + i_stride_n].f),
-                    hn::Load(d, f4_curr[i_off + i_stride_n - i_shift_x].f)
-                );
-                curl = hn::Sub(curl, hn::Load(d, f4_curr[i_off].f));
-                curl = hn::Add(curl, hn::Load(d, f4_curr[i_off - i_shift_y].f));
+                auto curl_z = hn::Sub(curr_hy, hn::Load(d, f4_curr[i_off + i_stride_n - i_shift_x].f));
+                curl_z = hn::Sub(curl_z, curr_hx);
+                curl_z = hn::Add(curl_z, hn::Load(d, f4_curr[i_off - i_shift_y].f));
 
-                volt_z = hn::MulAdd(vi_z, curl, hn::Mul(volt_z, vv_z));
+                volt_z = hn::MulAdd(vi_z, curl_z, hn::Mul(volt_z, vv_z));
                 hn::Store(volt_z, d, f4_volt[v_off_z].f);
             }
 
-            // Handle z=0 boundary with wraparound
+            // Handle z=0 boundary (wrap-around for periodic BC)
             const unsigned int index = op_idx_data[idx_base_xy];
             const int v_off = volt_base_xy;
             const int i_off_start = curr_base_xy;
             const int i_off_end = curr_base_xy + (numVectors - 1) * i_stride_z;
 
-            // Create shifted temp for boundary (insert 0, shift right)
             alignas(16) float temp_arr[4];
 
             // x-polarization at z=0
@@ -210,7 +203,7 @@ HWY_ATTR void UpdateVoltagesHwy(
 }
 
 /**
- * @brief Optimized current update using direct pointer arithmetic
+ * @brief Optimized current update with register reuse
  */
 HWY_ATTR void UpdateCurrentsHwy(
     f4vector* __restrict f4_curr,
@@ -225,7 +218,6 @@ HWY_ATTR void UpdateCurrentsHwy(
 {
     const F32x4 d;
 
-    // Pre-compute all strides once
     const int v_stride_n = f4_volt_ptr->stride(0);
     const int v_stride_x = f4_volt_ptr->stride(1);
     const int v_stride_y = f4_volt_ptr->stride(2);
@@ -236,12 +228,10 @@ HWY_ATTR void UpdateCurrentsHwy(
     const int i_stride_y = f4_curr_ptr->stride(2);
     const int i_stride_z = f4_curr_ptr->stride(3);
 
-    // Get index array strides
     const unsigned int idx_stride_x = Op->m_Op_index.stride(0);
     const unsigned int idx_stride_y = Op->m_Op_index.stride(1);
     const unsigned int* op_idx_data = Op->m_Op_index.data();
 
-    // Get pointers to compressed operators
     const f4vector* ii0 = Op->f4_ii_Compressed[0].data();
     const f4vector* ii1 = Op->f4_ii_Compressed[1].data();
     const f4vector* ii2 = Op->f4_ii_Compressed[2].data();
@@ -261,58 +251,52 @@ HWY_ATTR void UpdateCurrentsHwy(
             const int curr_base_xy = curr_base_x + posY * i_stride_y;
             const unsigned int idx_base_xy = idx_base_x + posY * idx_stride_y;
 
-            // Main loop: z = 0 to numVectors-2
             for (unsigned int posZ = 0; posZ < numVectors - 1; ++posZ) {
                 const unsigned int index = op_idx_data[idx_base_xy + posZ];
-
                 const int v_off = volt_base_xy + posZ * v_stride_z;
                 const int i_off = curr_base_xy + posZ * i_stride_z;
 
-                // x-pol
+                // Load voltage field values ONCE and reuse
+                const auto volt_ex = hn::Load(d, f4_volt[v_off].f);
+                const auto volt_ey = hn::Load(d, f4_volt[v_off + v_stride_n].f);
+                const auto volt_ez = hn::Load(d, f4_volt[v_off + 2*v_stride_n].f);
+
+                // x-pol: curl = Ez(y) - Ez(y+1) - Ey(z) + Ey(z+1)
                 auto curr_x = hn::Load(d, f4_curr[i_off].f);
                 auto ii_x = hn::Load(d, ii0[index].f);
                 auto iv_x = hn::Load(d, iv0[index].f);
 
-                auto curl = hn::Sub(
-                    hn::Load(d, f4_volt[v_off + 2*v_stride_n].f),
-                    hn::Load(d, f4_volt[v_off + 2*v_stride_n + v_stride_y].f)
-                );
-                curl = hn::Sub(curl, hn::Load(d, f4_volt[v_off + v_stride_n].f));
-                curl = hn::Add(curl, hn::Load(d, f4_volt[v_off + v_stride_n + v_stride_z].f));
+                auto curl_x = hn::Sub(volt_ez, hn::Load(d, f4_volt[v_off + 2*v_stride_n + v_stride_y].f));
+                curl_x = hn::Sub(curl_x, volt_ey);
+                curl_x = hn::Add(curl_x, hn::Load(d, f4_volt[v_off + v_stride_n + v_stride_z].f));
 
-                curr_x = hn::MulAdd(iv_x, curl, hn::Mul(curr_x, ii_x));
+                curr_x = hn::MulAdd(iv_x, curl_x, hn::Mul(curr_x, ii_x));
                 hn::Store(curr_x, d, f4_curr[i_off].f);
 
-                // y-pol
+                // y-pol: curl = Ex(z) - Ex(z+1) - Ez(x) + Ez(x+1)
                 const int i_off_y = i_off + i_stride_n;
                 auto curr_y = hn::Load(d, f4_curr[i_off_y].f);
                 auto ii_y = hn::Load(d, ii1[index].f);
                 auto iv_y = hn::Load(d, iv1[index].f);
 
-                curl = hn::Sub(
-                    hn::Load(d, f4_volt[v_off].f),
-                    hn::Load(d, f4_volt[v_off + v_stride_z].f)
-                );
-                curl = hn::Sub(curl, hn::Load(d, f4_volt[v_off + 2*v_stride_n].f));
-                curl = hn::Add(curl, hn::Load(d, f4_volt[v_off + 2*v_stride_n + v_stride_x].f));
+                auto curl_y = hn::Sub(volt_ex, hn::Load(d, f4_volt[v_off + v_stride_z].f));
+                curl_y = hn::Sub(curl_y, volt_ez);
+                curl_y = hn::Add(curl_y, hn::Load(d, f4_volt[v_off + 2*v_stride_n + v_stride_x].f));
 
-                curr_y = hn::MulAdd(iv_y, curl, hn::Mul(curr_y, ii_y));
+                curr_y = hn::MulAdd(iv_y, curl_y, hn::Mul(curr_y, ii_y));
                 hn::Store(curr_y, d, f4_curr[i_off_y].f);
 
-                // z-pol
+                // z-pol: curl = Ey(x) - Ey(x+1) - Ex(y) + Ex(y+1)
                 const int i_off_z = i_off_y + i_stride_n;
                 auto curr_z = hn::Load(d, f4_curr[i_off_z].f);
                 auto ii_z = hn::Load(d, ii2[index].f);
                 auto iv_z = hn::Load(d, iv2[index].f);
 
-                curl = hn::Sub(
-                    hn::Load(d, f4_volt[v_off + v_stride_n].f),
-                    hn::Load(d, f4_volt[v_off + v_stride_n + v_stride_x].f)
-                );
-                curl = hn::Sub(curl, hn::Load(d, f4_volt[v_off].f));
-                curl = hn::Add(curl, hn::Load(d, f4_volt[v_off + v_stride_y].f));
+                auto curl_z = hn::Sub(volt_ey, hn::Load(d, f4_volt[v_off + v_stride_n + v_stride_x].f));
+                curl_z = hn::Sub(curl_z, volt_ex);
+                curl_z = hn::Add(curl_z, hn::Load(d, f4_volt[v_off + v_stride_y].f));
 
-                curr_z = hn::MulAdd(iv_z, curl, hn::Mul(curr_z, ii_z));
+                curr_z = hn::MulAdd(iv_z, curl_z, hn::Mul(curr_z, ii_z));
                 hn::Store(curr_z, d, f4_curr[i_off_z].f);
             }
 
@@ -383,7 +367,6 @@ HWY_AFTER_NAMESPACE();
 
 namespace openEMS {
 
-// Cache function pointers for faster dispatch
 using UpdateVoltagesPtr = void (*)(f4vector*, f4vector*, const Operator_SSE_Compressed*,
     const ArrayLib::ArrayENG<f4vector>*, const ArrayLib::ArrayENG<f4vector>*,
     unsigned int, unsigned int, unsigned int, unsigned int);
