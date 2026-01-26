@@ -26,6 +26,12 @@ keywords = ["fdtd", "electromagnetic", "simulation", "physics", "simd"]
 
 [project.optional-dependencies]
 dev = ["pytest", "numpy"]
+docs = [
+    "mkdocs>=1.5.0",
+    "mkdocs-material>=9.4.0",
+    "mkdocstrings>=0.24.0",
+    "mkdocstrings-python>=1.7.0",
+]
 
 [tool.maturin]
 features = ["python"]
