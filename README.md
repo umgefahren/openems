@@ -1,7 +1,7 @@
 # openEMS - Open Electromagnetic Field Solver
 
 [![Rust Build](https://github.com/umgefahren/openems/actions/workflows/rust.yml/badge.svg)](https://github.com/umgefahren/openems/actions/workflows/rust.yml)
-[![codecov](https://codecov.io/gh/umgefahren/openems/graph/badge.svg)](https://codecov.io/gh/umgefahren/openems)
+![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/umgefahren/GIST_ID/raw/coverage.json)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 A high-performance FDTD (Finite-Difference Time-Domain) electromagnetic field solver written in Rust.
@@ -69,7 +69,7 @@ sim.run(1000)?; // Run for 1000 timesteps
 
 ## Test Coverage
 
-Code coverage is tracked automatically via [Codecov](https://codecov.io/gh/umgefahren/openems). The coverage badge above shows the current overall coverage percentage.
+Code coverage is tracked automatically via CI. The coverage badge above shows the current overall coverage percentage, updated on each push to main.
 
 The codebase maintains high test coverage on core modules:
 
@@ -81,8 +81,6 @@ The codebase maintains high test coverage on core modules:
 | `excitation.rs` | 98% |
 | `engine_interface.rs` | 97% |
 | `probes.rs` | 97% |
-
-View detailed coverage reports and trends on the [Codecov dashboard](https://codecov.io/gh/umgefahren/openems).
 
 ## Python Bindings
 

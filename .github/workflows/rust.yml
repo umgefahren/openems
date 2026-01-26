@@ -105,14 +105,29 @@ jobs:
         restore-keys: ${{ runner.os }}-cargo-coverage-
 
     - name: Generate coverage report
-      run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+      run: |
+        cargo llvm-cov --all-features --json --output-path coverage.json
+        cargo llvm-cov report --all-features
 
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
+    - name: Extract coverage percentage
+      id: coverage
+      run: |
+        COVERAGE=$(jq '.data[0].totals.lines.percent' coverage.json | xargs printf "%.1f")
+        echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
+        echo "Coverage: $COVERAGE%"
+
+    - name: Create coverage badge
+      uses: schneegans/dynamic-badges-action@v1.7.0
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
       with:
-        files: lcov.info
-        fail_ci_if_error: false
-        token: ${{ secrets.CODECOV_TOKEN }}
+        auth: ${{ secrets.GIST_TOKEN }}
+        gistID: ${{ vars.COVERAGE_GIST_ID }}
+        filename: coverage.json
+        label: coverage
+        message: ${{ steps.coverage.outputs.percentage }}%
+        valColorRange: ${{ steps.coverage.outputs.percentage }}
+        maxColorRange: 100
+        minColorRange: 0
 
   benchmark:
     runs-on: ubuntu-latest
