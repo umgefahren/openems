@@ -216,9 +216,9 @@ impl GpuEngine {
         // GlobalID.x -> k (fastest mem) -> dispatch_x covers nz
         // GlobalID.y -> j -> dispatch_y covers ny
         // GlobalID.z -> i -> dispatch_z covers nx
-        let dispatch_x = (dims.nz as u32 + 63) / 64; // Workgroup size 64 along X
-        let dispatch_y = (dims.ny as u32 + 1) / 2; // Workgroup size 2 along Y
-        let dispatch_z = (dims.nx as u32 + 1) / 2; // Workgroup size 2 along Z
+        let dispatch_x = (dims.nz as u32).div_ceil(64); // Workgroup size 64 along X
+        let dispatch_y = (dims.ny as u32).div_ceil(2); // Workgroup size 2 along Y
+        let dispatch_z = (dims.nx as u32).div_ceil(2); // Workgroup size 2 along Z
 
         Self {
             instance,

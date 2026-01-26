@@ -690,18 +690,11 @@ mod tests {
             vec![0.0, PI / 2.0, PI],
             vec![0.0, 0.01, 0.02],
         );
-        let _dt = grid.calculate_timestep(&grid);
+        let dt = 1e-12;
 
-        let op = CylindricalOperator::new(grid, BoundaryConditions::default()).unwrap();
+        let op = CylindricalOperator::new(grid, dt);
 
-        assert_eq!(op.e_coefficients().ca[0].len(), 8);
-    }
-
-    // Helper function for tests
-    impl CylindricalGrid {
-        fn calculate_timestep(&self, _grid: &CylindricalGrid) -> f64 {
-            1e-12 // Placeholder
-        }
+        assert_eq!(op.vv().x.len(), 8);
     }
 
     #[test]

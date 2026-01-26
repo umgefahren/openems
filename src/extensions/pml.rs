@@ -753,8 +753,10 @@ mod tests {
         assert_eq!(ki, 0.0);
 
         // Check grading
+        // At pos=4 (middle of 8-layer PML), normalized depth is 0.5
+        // kv = 1000.0 * 0.5^3 = 125.0
         let (kv, _ki) = upml.calculate_kappa(0, 0, [4, 25, 25], true, 8, 0.008, 1000.0, 3.0);
-        assert!((kv - 1.0).abs() < 1e-6); // First layer should be 1.0 (start of grading)
+        assert!((kv - 125.0).abs() < 1e-6);
     }
 
     #[test]
