@@ -149,15 +149,13 @@ impl GpuEngine {
                     // Heuristic: Use f32 if Ca != 1.0 (lossy) and Ca != 0.0 (PEC).
                     // Or if we implement PML later, we mark those regions.
                     // For now: Standard = 0, HighPrecision = 1.
-                    let is_lossy = (ca[0] - 1.0).abs() > 1e-5 || (ca[0].abs() > 1e-5 && ca[0] < 0.99);
+                    let is_lossy =
+                        (ca[0] - 1.0).abs() > 1e-5 || (ca[0].abs() > 1e-5 && ca[0] < 0.99);
                     let class_id = if is_lossy { 1u32 } else { 0u32 };
                     cell_class_data.push(class_id);
 
                     // Pack data
-                    let data_floats = [
-                        ca[0], ca[1], ca[2], cb[0],
-                        cb[1], cb[2], 0.0, 0.0
-                    ];
+                    let data_floats = [ca[0], ca[1], ca[2], cb[0], cb[1], cb[2], 0.0, 0.0];
 
                     // f32 buffer
                     for &val in &data_floats {
@@ -179,7 +177,7 @@ impl GpuEngine {
                 }
             }
         }
-        
+
         // If fallback, e_coeff_f16_data is empty, we point to f32 data?
         // No, shader expects binding 2 to exist.
         // If !supports_f16, alias float16 = f32.
@@ -205,14 +203,14 @@ impl GpuEngine {
         // But we follow symmetry.
         let mut h_coeff_f16_data: Vec<u8> = Vec::with_capacity(total * 8 * 2);
         let mut h_coeff_f32_data: Vec<u8> = Vec::with_capacity(total * 8 * 4);
-        
-        // Note: cell_class is shared? Or separate? 
+
+        // Note: cell_class is shared? Or separate?
         // We reused cell_class logic for E. H might have different requirements (magnetic loss).
         // The prompt implies a single cell_class buffer.
         // We'll assume cell_class covers both (union of requirements).
         // Since we already filled cell_class based on E, we might need to update it for H?
         // But H update uses cell_class to choose H coeffs.
-        
+
         for k in 0..dims.nz {
             for j in 0..dims.ny {
                 for i in 0..dims.nx {
@@ -226,11 +224,8 @@ impl GpuEngine {
                         h_coeff.db[1].get(i, j, k),
                         h_coeff.db[2].get(i, j, k),
                     ];
-                    
-                    let data_floats = [
-                        da[0], da[1], da[2], db[0],
-                        db[1], db[2], 0.0, 0.0
-                    ];
+
+                    let data_floats = [da[0], da[1], da[2], db[0], db[1], db[2], 0.0, 0.0];
 
                     for &val in &data_floats {
                         h_coeff_f32_data.extend_from_slice(bytemuck::bytes_of(&val));
@@ -245,7 +240,7 @@ impl GpuEngine {
                 }
             }
         }
-        
+
         if !supports_f16 {
             h_coeff_f16_data = h_coeff_f32_data.clone();
         }
@@ -271,7 +266,8 @@ impl GpuEngine {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("FDTD Bind Group Layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry { // E Field
+                wgpu::BindGroupLayoutEntry {
+                    // E Field
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -281,7 +277,8 @@ impl GpuEngine {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry { // H Field
+                wgpu::BindGroupLayoutEntry {
+                    // H Field
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -291,7 +288,8 @@ impl GpuEngine {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry { // Coeff f16 (E)
+                wgpu::BindGroupLayoutEntry {
+                    // Coeff f16 (E)
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -301,7 +299,8 @@ impl GpuEngine {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry { // Coeff f32 (E)
+                wgpu::BindGroupLayoutEntry {
+                    // Coeff f32 (E)
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -311,7 +310,8 @@ impl GpuEngine {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry { // Cell Class
+                wgpu::BindGroupLayoutEntry {
+                    // Cell Class
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -321,7 +321,8 @@ impl GpuEngine {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry { // Coeff f16 (H)
+                wgpu::BindGroupLayoutEntry {
+                    // Coeff f16 (H)
                     binding: 5,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -331,7 +332,8 @@ impl GpuEngine {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry { // Coeff f32 (H)
+                wgpu::BindGroupLayoutEntry {
+                    // Coeff f32 (H)
                     binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -419,12 +421,12 @@ impl GpuEngine {
         // GlobalID.x -> k (fastest mem) -> dispatch_x covers nz (ILP=4)
         // GlobalID.y -> j -> dispatch_y covers ny
         // GlobalID.z -> i -> dispatch_z covers nx
-        
+
         // Workgroup size is (64, 1, 1) defined in shader.
         // Each thread along X (k) processes 4 elements (ILP=4).
         // So one workgroup covers 64 * 4 = 256 elements along Z.
-        let dispatch_x = (dims.nz as u32).div_ceil(256); 
-        
+        let dispatch_x = (dims.nz as u32).div_ceil(256);
+
         // Threads along Y and Z process 1 element each.
         let dispatch_y = dims.ny as u32;
         let dispatch_z = dims.nx as u32;
