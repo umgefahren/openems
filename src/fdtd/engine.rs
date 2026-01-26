@@ -790,7 +790,10 @@ mod tests {
     #[test]
     fn test_energy_conservation_gpu() {
         // This test requires a GPU or software rasterizer (like Lavapipe).
-        // It might panic if no suitable adapter is found, which is expected behavior for GpuEngine::new().
+        if !GpuEngine::is_available() {
+            println!("Skipping GPU test: no suitable adapter found.");
+            return;
+        }
         run_energy_test(EngineType::Gpu);
     }
 }

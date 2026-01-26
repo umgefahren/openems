@@ -26,6 +26,18 @@ pub struct GpuEngine {
 }
 
 impl GpuEngine {
+    /// Check if GPU acceleration is available on this system.
+    pub fn is_available() -> bool {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }));
+
+        adapter.is_ok()
+    }
+
     /// Create a new GPU engine.
     pub fn new(operator: &Operator) -> Self {
         let dims = operator.dimensions();
