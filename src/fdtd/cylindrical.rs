@@ -685,21 +685,16 @@ mod tests {
 
     #[test]
     fn test_cylindrical_operator() {
-        let grid = CylindricalGrid::uniform(0.005, 0.015, 10, 16, 0.0, 0.02, 10);
-        let _dt_calc = grid.calculate_timestep(&grid);
-        // Use fixed dt for test
+        let grid = CylindricalGrid::new(
+            vec![0.01, 0.02, 0.03],
+            vec![0.0, PI / 2.0, PI],
+            vec![0.0, 0.01, 0.02],
+        );
         let dt = 1e-12;
 
-        let operator = CylindricalOperator::new(grid, dt);
+        let op = CylindricalOperator::new(grid, dt);
 
-        assert!(operator.dt() > 0.0);
-    }
-
-    // Helper function for tests
-    impl CylindricalGrid {
-        fn calculate_timestep(&self, _grid: &CylindricalGrid) -> f64 {
-            1e-12 // Placeholder
-        }
+        assert_eq!(op.vv().x.len(), 8);
     }
 
     #[test]
