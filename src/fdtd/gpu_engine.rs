@@ -416,9 +416,18 @@ impl GpuEngine {
         });
 
         // Dispatch dimensions swapped to match shader mapping:
-        let dispatch_x = (dims.nz as u32).div_ceil(64); // Workgroup size 64 along X
-        let dispatch_y = (dims.ny as u32).div_ceil(2); // Workgroup size 2 along Y
-        let dispatch_z = (dims.nx as u32).div_ceil(2); // Workgroup size 2 along Z
+        // GlobalID.x -> k (fastest mem) -> dispatch_x covers nz (ILP=4)
+        // GlobalID.y -> j -> dispatch_y covers ny
+        // GlobalID.z -> i -> dispatch_z covers nx
+        
+        // Workgroup size is (64, 1, 1) defined in shader.
+        // Each thread along X (k) processes 4 elements (ILP=4).
+        // So one workgroup covers 64 * 4 = 256 elements along Z.
+        let dispatch_x = (dims.nz as u32).div_ceil(256); 
+        
+        // Threads along Y and Z process 1 element each.
+        let dispatch_y = dims.ny as u32;
+        let dispatch_z = dims.nx as u32;
 
         Self {
             instance,
