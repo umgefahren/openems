@@ -31,3 +31,5 @@ tmp*
 
 # Documentation builds
 doc/_build/
+rust-openems/target/
+target/
