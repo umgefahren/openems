@@ -116,7 +116,8 @@ def run_benchmark():
         print()
 
     # Grid sizes to test - including larger sizes where GPU should excel
-    grid_sizes = [64, 96, 128, 160, 192, 256, 320, 384, 448, 512]
+    # Note: 512³ exceeds GPU buffer size limits (~4GB) so we cap at 448³
+    grid_sizes = [64, 96, 128, 160, 192, 256, 320, 384, 448]
 
     # Number of timesteps
     timesteps = 100

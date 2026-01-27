@@ -12,7 +12,51 @@ This is a complete Rust rewrite of the openEMS FDTD (Finite-Difference Time-Doma
 cargo build                    # Debug build
 cargo build --release          # Optimized release build
 cargo build --all-features     # Build with all features (python, hdf5)
-maturin develop                # Python bindings (development mode)
+```
+
+## Python Bindings
+
+The project provides Python bindings via PyO3/maturin. To build and test:
+
+```bash
+# Set up Python environment (using uv)
+cd python
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install numpy matplotlib maturin
+
+# Build the Rust library with Python bindings
+cd ..
+unset CONDA_PREFIX  # If conda is active, maturin conflicts with it
+maturin develop --release --features python
+
+# Test the bindings
+python -c "import openems_rust; print(openems_rust.VERSION)"
+
+# Run GPU performance benchmark
+python python/gpu_benchmark.py
+```
+
+### Python API Example
+
+```python
+import openems_rust as ems
+
+# Check GPU availability
+print("GPU available:", ems.OpenEMS.gpu_available())
+
+# Create simulation
+grid = ems.Grid.uniform(100, 100, 100, 1e-3)  # 100³ grid, 1mm cells
+sim = ems.OpenEMS(num_timesteps=1000)
+sim.set_grid(grid)
+sim.set_engine_type('gpu')  # Options: 'basic', 'simd', 'parallel', 'gpu'
+sim.add_gauss_excite(2e9, 1e9, direction=2, position=(50, 50, 50))
+sim.set_boundary_cond(['pec'] * 6)
+sim.set_verbose(0)
+
+# Run and get statistics
+result = sim.run()
+print(f"Speed: {result.speed_mcells_per_sec:.2f} MC/s")
 ```
 
 ## Testing
@@ -75,9 +119,11 @@ Implemented extensions: PML, Mur ABC, dispersive materials (Lorentz/Drude/Debye)
 
 ### Performance Targets
 
-- Engine: 700+ MC/s (mega-cells per second)
+- CPU Parallel Engine: 300-500 MC/s (mega-cells per second)
+- GPU Engine: 1000-1300 MC/s (~3x faster than CPU)
 - SIMD speedup: ~2x over scalar
 - Parallel speedup: ~10x on 8+ core machines
+- GPU buffer limit: Max ~450³ grid (~90M cells) due to WebGPU buffer size limits
 
 ## Key Documentation
 
