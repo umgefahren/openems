@@ -29,5 +29,4 @@ dev = ["pytest", "numpy"]
 
 [tool.maturin]
 features = ["python"]
-python-source = "python"
-module-name = "openems._rust"
+module-name = "openems_rust"
