@@ -251,8 +251,9 @@ fn update_e(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // Apply excitations for this timestep
-    // Only the first thread in the workgroup applies excitations to avoid race conditions
-    if (global_id.x == 0u && global_id.y == 0u && global_id.z == 0u) {
+    // Use thread (0, 1, 1) since (0, 0, 0) returns early due to boundary check
+    // (global_id.z=1 means i=1, global_id.y=1 means j=1, global_id.x=0 means k_base=0)
+    if (global_id.x == 0u && global_id.y == 1u && global_id.z == 1u) {
         let ts = timestep_data.current_timestep;
         let exc_start = excitation_offsets[ts];
         let exc_end = excitation_offsets[ts + 1u];
