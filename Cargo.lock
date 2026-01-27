@@ -1221,6 +1221,7 @@ dependencies = [
  "num-complex",
  "num-traits",
  "numpy",
+ "paste",
  "pollster",
  "pyo3",
  "quick-xml",

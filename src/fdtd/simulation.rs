@@ -3,11 +3,12 @@
 //! The Simulation struct provides a convenient interface for setting up
 //! and running FDTD simulations.
 
-use super::engine::Engine;
-use super::excitation::Excitation;
-use super::operator::Operator;
-use super::timestep::TimestepInfo;
-use super::{BoundaryConditions, EngineType};
+use super::{
+    BoundaryConditions, EnergyMonitorConfig, EngineBatch, EngineType, Excitation, Operator,
+    ScheduledExcitation, TerminationConfig, TerminationReason, TimestepInfo,
+};
+use crate::extensions::AnyExtension;
+use crate::fdtd::Engine;
 use crate::geometry::Grid;
 use crate::{Error, Result};
 
@@ -86,6 +87,8 @@ pub struct Simulation {
     verbose: u8,
     /// Show progress bar
     show_progress: bool,
+    /// Batch size for timestep execution (None = auto-select based on engine type)
+    batch_size: Option<u64>,
 }
 
 impl Simulation {
@@ -102,6 +105,7 @@ impl Simulation {
             engine: None,
             verbose: 1,
             show_progress: true,
+            batch_size: None, // Auto-select based on engine type
         }
     }
 
@@ -141,6 +145,16 @@ impl Simulation {
         self
     }
 
+    /// Set batch size for timestep execution.
+    ///
+    /// Default (None) auto-selects based on engine type:
+    /// - Basic/SIMD/Parallel: 100 timesteps per batch
+    /// - GPU: 1000 timesteps per batch (minimizes CPU↔GPU transfers)
+    pub fn set_batch_size(&mut self, batch_size: Option<u64>) -> &mut Self {
+        self.batch_size = batch_size;
+        self
+    }
+
     /// Get timestep information.
     pub fn timestep_info(&self) -> TimestepInfo {
         TimestepInfo::calculate(&self.grid)
@@ -173,7 +187,7 @@ impl Simulation {
         let operator = Operator::new(self.grid.clone(), self.boundaries.clone())?;
 
         // Create engine
-        let engine = Engine::new(&operator, self.engine_type);
+        let engine = Engine::new(&operator, self.engine_type)?;
 
         self.operator = Some(operator);
         self.engine = Some(engine);
@@ -182,7 +196,7 @@ impl Simulation {
         Ok(())
     }
 
-    /// Run the simulation.
+    /// Run the simulation using batched execution.
     pub fn run(&mut self) -> Result<SimulationStats> {
         // Set up if not already done
         if self.state == SimulationState::Created {
@@ -199,7 +213,15 @@ impl Simulation {
         let engine = self.engine.as_mut().unwrap();
         let dt = operator.timestep();
 
-        // Determine number of timesteps
+        // Determine batch size based on engine type
+        let batch_size = self.batch_size.unwrap_or_else(|| {
+            match self.engine_type {
+                EngineType::Gpu => 1000, // Large batches for GPU to minimize transfers
+                _ => 100,                // Smaller batches for CPU engines
+            }
+        });
+
+        // Determine total timesteps to execute
         let max_timesteps = match &self.end_condition {
             EndCondition::Timesteps(n) => *n,
             EndCondition::SimulationTime(t) => (t / dt).ceil() as u64,
@@ -229,49 +251,77 @@ impl Simulation {
         let mut peak_energy = 0.0f64;
         let mut timesteps_run = 0u64;
 
-        // Main simulation loop
+        // Main batching loop
         while timesteps_run < max_timesteps {
-            // Apply excitations
-            let t = timesteps_run as f64 * dt;
-            for exc in &self.excitations {
-                if exc.is_active(t) {
-                    let value = exc.evaluate(t) as f32;
-                    let (i, j, k) = exc.position;
-                    engine.inject_e_field(i, j, k, exc.direction, value, exc.soft_source);
+            let remaining = max_timesteps - timesteps_run;
+            let this_batch_size = remaining.min(batch_size);
+
+            // Pre-sample excitations for this batch
+            let scheduled_excitations: Vec<ScheduledExcitation> = self
+                .excitations
+                .iter()
+                .map(|exc| {
+                    ScheduledExcitation::from_excitation(exc, timesteps_run, this_batch_size, dt)
+                })
+                .collect();
+
+            // Configure batch execution
+            // Note: Using empty extension list for now - extensions will be added later
+            let batch = EngineBatch {
+                num_steps: Some(this_batch_size),
+                excitations: scheduled_excitations,
+                extensions: Vec::<AnyExtension>::new(), // No extensions yet
+                termination: TerminationConfig {
+                    max_timesteps: Some(this_batch_size),
+                    energy_decay_db: energy_threshold,
+                    check_interval: 100,
+                },
+                energy_monitoring: EnergyMonitorConfig {
+                    sample_interval: 100, // Sample energy every 100 steps
+                    track_peak: true,
+                    decay_threshold: energy_threshold,
+                },
+            };
+
+            // Execute batch
+            let result = engine.run_batch(batch)?;
+            timesteps_run += result.timesteps_executed;
+
+            // Update peak energy from batch samples
+            for sample in &result.energy_samples {
+                if sample.total_energy > peak_energy {
+                    peak_energy = sample.total_energy;
                 }
             }
 
-            // Perform timestep
-            engine.step(operator)?;
-            timesteps_run += 1;
-
-            // Check energy for convergence/decay
-            if timesteps_run.is_multiple_of(100) {
-                let energy = engine.total_energy(operator);
-                if energy > peak_energy {
-                    peak_energy = energy;
-                }
-
-                // Check energy decay condition
-                if let Some(threshold_db) = energy_threshold {
-                    if peak_energy > 0.0 {
-                        let decay_db = 10.0 * (energy / peak_energy).log10();
-                        if decay_db < threshold_db {
-                            if self.verbose >= 1 {
-                                info!(
-                                    "Energy decay reached: {:.1} dB at timestep {}",
-                                    decay_db, timesteps_run
-                                );
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Update progress
+            // Update progress bar
             if let Some(ref pb) = progress {
                 pb.set_position(timesteps_run);
+            }
+
+            // Check batch termination reason
+            match result.termination_reason {
+                TerminationReason::EnergyDecay { final_decay_db } => {
+                    if self.verbose >= 1 {
+                        info!(
+                            "Energy decay reached: {:.1} dB at timestep {}",
+                            final_decay_db, timesteps_run
+                        );
+                    }
+                    break;
+                }
+                TerminationReason::ExtensionStop { ref reason } => {
+                    if self.verbose >= 1 {
+                        info!(
+                            "Extension stopped simulation: {} at timestep {}",
+                            reason, timesteps_run
+                        );
+                    }
+                    break;
+                }
+                TerminationReason::StepsCompleted => {
+                    // Continue to next batch
+                }
             }
         }
 
@@ -280,7 +330,11 @@ impl Simulation {
         }
 
         let wall_time = start_time.elapsed().as_secs_f64();
-        let final_energy = engine.total_energy(operator);
+
+        // Calculate final energy
+        let (e_field, h_field) = engine.read_fields();
+        let final_energy = e_field.energy() + h_field.energy();
+
         let num_cells = operator.dimensions().total();
         let speed = (timesteps_run as f64 * num_cells as f64) / wall_time / 1e6;
 

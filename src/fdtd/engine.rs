@@ -7,6 +7,7 @@ use crate::arrays::{Dimensions, VectorField3D};
 use crate::Result;
 use rayon::prelude::*;
 
+use super::engine_impl::EngineImpl;
 use super::gpu_engine::GpuEngine;
 use super::operator::Operator;
 use super::EngineType;
@@ -84,7 +85,7 @@ impl Engine {
         let num_threads = rayon::current_num_threads();
 
         let gpu_engine = if engine_type == EngineType::Gpu {
-            Some(GpuEngine::new(operator))
+            Some(GpuEngine::new(operator).expect("Failed to create GPU engine"))
         } else {
             None
         };

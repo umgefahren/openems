@@ -391,6 +391,280 @@ impl ConductingSheet {
             elem.e_prev = 0.0;
         }
     }
+
+    /// Generate GPU extension data for shader compilation.
+    ///
+    /// Returns None if the sheet is not active.
+    pub fn gpu_data(&self) -> Option<crate::extensions::GpuExtensionData> {
+        if !self.is_active() {
+            return None;
+        }
+
+        // GPU conducting sheet metadata
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct GpuSheetMeta {
+            // Number of sheet elements
+            num_elements: u32,
+            // Normal direction of sheet (0=x, 1=y, 2=z)
+            normal_dir: u32,
+            // Sheet position along normal
+            position: u32,
+            // Padding
+            _padding: u32,
+        }
+
+        // GPU element data: position and tangent direction
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct GpuSheetElement {
+            // Position [i, j, k]
+            pos: [u32; 3],
+            // Tangential direction (0=x, 1=y, 2=z)
+            tan_dir: u32,
+        }
+
+        // GPU ADE coefficients per element (both Lorentz poles)
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct GpuSheetAdeCoeffs {
+            // First Lorentz pole: c1, c2, c3, c4
+            ade1_c1: f32,
+            ade1_c2: f32,
+            ade1_c3: f32,
+            ade1_c4: f32,
+            // Second Lorentz pole: c1, c2, c3
+            ade2_c1: f32,
+            ade2_c2: f32,
+            ade2_c3: f32,
+            _padding: f32,
+        }
+
+        let meta = GpuSheetMeta {
+            num_elements: self.elements.len() as u32,
+            normal_dir: self.config.normal_direction as u32,
+            position: self.config.position as u32,
+            _padding: 0,
+        };
+
+        // Pack element positions
+        let mut elements_data: Vec<u8> = Vec::with_capacity(self.elements.len() * 16);
+        for elem in &self.elements {
+            let gpu_elem = GpuSheetElement {
+                pos: [elem.pos[0] as u32, elem.pos[1] as u32, elem.pos[2] as u32],
+                tan_dir: elem.tan_dir as u32,
+            };
+            elements_data.extend_from_slice(bytemuck::bytes_of(&gpu_elem));
+        }
+
+        // Pack ADE coefficients
+        let mut coeffs_data: Vec<u8> = Vec::with_capacity(self.elements.len() * 32);
+        for elem in &self.elements {
+            let gpu_coeffs = GpuSheetAdeCoeffs {
+                ade1_c1: elem.ade1.c1,
+                ade1_c2: elem.ade1.c2,
+                ade1_c3: elem.ade1.c3,
+                ade1_c4: elem.ade1.c4,
+                ade2_c1: elem.ade2.c1,
+                ade2_c2: elem.ade2.c2,
+                ade2_c3: elem.ade2.c3,
+                _padding: 0.0,
+            };
+            coeffs_data.extend_from_slice(bytemuck::bytes_of(&gpu_coeffs));
+        }
+
+        // Pack auxiliary storage (j_aux1, j_aux2, e_prev per element)
+        let mut storage_data: Vec<u8> = Vec::with_capacity(self.elements.len() * 12);
+        for elem in &self.elements {
+            storage_data.extend_from_slice(bytemuck::bytes_of(&elem.j_aux1));
+            storage_data.extend_from_slice(bytemuck::bytes_of(&elem.j_aux2));
+            storage_data.extend_from_slice(bytemuck::bytes_of(&elem.e_prev));
+        }
+        // Pad to 16 bytes per element for alignment
+        while storage_data.len() < self.elements.len() * 16 {
+            storage_data.extend_from_slice(bytemuck::bytes_of(&0.0f32));
+        }
+
+        let shader_code = Self::generate_sheet_shader();
+
+        Some(crate::extensions::GpuExtensionData {
+            shader_code,
+            buffers: vec![
+                crate::extensions::GpuBufferDescriptor {
+                    label: "Conducting Sheet Metadata".to_string(),
+                    data: bytemuck::bytes_of(&meta).to_vec(),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                    binding: 24,
+                },
+                crate::extensions::GpuBufferDescriptor {
+                    label: "Conducting Sheet Elements".to_string(),
+                    data: elements_data,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    binding: 25,
+                },
+                crate::extensions::GpuBufferDescriptor {
+                    label: "Conducting Sheet ADE Coefficients".to_string(),
+                    data: coeffs_data,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    binding: 26,
+                },
+                crate::extensions::GpuBufferDescriptor {
+                    label: "Conducting Sheet Storage".to_string(),
+                    data: storage_data,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    binding: 27,
+                },
+            ],
+            bind_group_entries: vec![
+                wgpu::BindGroupLayoutEntry {
+                    binding: 24,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 25,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 26,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 27,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        })
+    }
+
+    /// Generate WGSL shader code for conducting sheet update.
+    fn generate_sheet_shader() -> String {
+        r#"
+// Conducting Sheet Extension Declarations
+struct SheetMeta {
+    num_elements: u32,
+    normal_dir: u32,
+    position: u32,
+    _padding: u32,
+}
+
+struct SheetElement {
+    pos: vec3<u32>,
+    tan_dir: u32,
+}
+
+struct SheetAdeCoeffs {
+    ade1_c1: f32,
+    ade1_c2: f32,
+    ade1_c3: f32,
+    ade1_c4: f32,
+    ade2_c1: f32,
+    ade2_c2: f32,
+    ade2_c3: f32,
+    _padding: f32,
+}
+
+struct SheetStorage {
+    j_aux1: f32,
+    j_aux2: f32,
+    e_prev: f32,
+    _padding: f32,
+}
+
+@group(0) @binding(24) var<uniform> sheet_meta: SheetMeta;
+@group(0) @binding(25) var<storage, read> sheet_elements: array<SheetElement>;
+@group(0) @binding(26) var<storage, read> sheet_coeffs: array<SheetAdeCoeffs>;
+@group(0) @binding(27) var<storage, read_write> sheet_storage: array<SheetStorage>;
+
+// Get sheet element by index
+fn sheet_get_element(idx: u32) -> SheetElement {
+    return sheet_elements[idx];
+}
+
+// Get ADE coefficients for an element
+fn sheet_get_coeffs(idx: u32) -> SheetAdeCoeffs {
+    return sheet_coeffs[idx];
+}
+
+// Get storage values for an element
+fn sheet_get_storage(idx: u32) -> SheetStorage {
+    return sheet_storage[idx];
+}
+
+// Set storage values for an element
+fn sheet_set_storage(idx: u32, s: SheetStorage) {
+    sheet_storage[idx] = s;
+}
+
+// Find sheet element at given position, returns -1 if not found
+fn sheet_find_element(gi: u32, gj: u32, gk: u32, tan_dir: u32) -> i32 {
+    for (var idx = 0u; idx < sheet_meta.num_elements; idx++) {
+        let elem = sheet_elements[idx];
+        if (elem.pos.x == gi && elem.pos.y == gj && elem.pos.z == gk && elem.tan_dir == tan_dir) {
+            return i32(idx);
+        }
+    }
+    return -1;
+}
+
+// Apply conducting sheet update to E-field
+// Returns the modified E-field value
+fn sheet_apply_update(e_current: f32, idx: u32) -> f32 {
+    let coeffs = sheet_get_coeffs(idx);
+    var storage = sheet_get_storage(idx);
+
+    // Update auxiliary currents (ADE)
+    let j1_new = coeffs.ade1_c3 * storage.j_aux1 + coeffs.ade1_c2 * e_current;
+    let j2_new = coeffs.ade2_c3 * storage.j_aux2 + coeffs.ade2_c2 * e_current;
+
+    // Calculate total current modification
+    let j_total = coeffs.ade1_c4 * e_current  // Drude term
+        + coeffs.ade1_c1 * (j1_new + storage.j_aux1) * 0.5  // Lorentz 1
+        + coeffs.ade2_c1 * (j2_new + storage.j_aux2) * 0.5; // Lorentz 2
+
+    // Modify E-field
+    let e_modified = e_current - j_total;
+
+    // Store updated values
+    storage.j_aux1 = j1_new;
+    storage.j_aux2 = j2_new;
+    storage.e_prev = e_current;
+    sheet_set_storage(idx, storage);
+
+    return e_modified;
+}
+
+// Check if position is on conducting sheet boundary
+fn sheet_is_on_boundary(gi: u32, gj: u32, gk: u32) -> bool {
+    var pos = array<u32, 3>(gi, gj, gk);
+    return pos[sheet_meta.normal_dir] == sheet_meta.position;
+}
+"#
+        .to_string()
+    }
 }
 
 /// Manager for multiple conducting sheets.

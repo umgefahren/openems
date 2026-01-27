@@ -667,6 +667,191 @@ impl Upml {
             }
         }
     }
+
+    /// Generate GPU extension data for shader compilation.
+    ///
+    /// Returns None if PML is not active.
+    pub fn gpu_data(&self) -> Option<crate::extensions::GpuExtensionData> {
+        if !self.is_active() {
+            return None;
+        }
+
+        // Pack all region data into GPU-friendly format
+        let mut coefficients_data: Vec<u8> = Vec::new();
+        let mut flux_data: Vec<u8> = Vec::new();
+        let mut metadata_data: Vec<u8> = Vec::new();
+
+        // GPU PML region metadata: [start_x, start_y, start_z, size_x, size_y, size_z, direction, is_max]
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct GpuPmlRegionMeta {
+            start: [u32; 3],
+            size: [u32; 3],
+            direction: u32,
+            padding: u32,
+        }
+
+        for (region_idx, region) in self.regions.iter().enumerate() {
+            let meta = GpuPmlRegionMeta {
+                start: [
+                    region.start[0] as u32,
+                    region.start[1] as u32,
+                    region.start[2] as u32,
+                ],
+                size: [
+                    region.size[0] as u32,
+                    region.size[1] as u32,
+                    region.size[2] as u32,
+                ],
+                direction: region_idx as u32 / 2, // 0,1=X, 2,3=Y, 4,5=Z
+                padding: 0,
+            };
+            metadata_data.extend_from_slice(bytemuck::bytes_of(&meta));
+
+            // Pack coefficients: [vv, vvfo, vvfn, ii, iifo, iifn] for each cell, for each component
+            let dims = region.dims();
+            for k in 0..dims.nz {
+                for j in 0..dims.ny {
+                    for i in 0..dims.nx {
+                        for n in 0..3 {
+                            // Voltage coefficients
+                            let vv = region.vv[n].get(i, j, k);
+                            let vvfo = region.vvfo[n].get(i, j, k);
+                            let vvfn = region.vvfn[n].get(i, j, k);
+
+                            // Current coefficients
+                            let ii = region.ii[n].get(i, j, k);
+                            let iifo = region.iifo[n].get(i, j, k);
+                            let iifn = region.iifn[n].get(i, j, k);
+
+                            // Pack as 6 f32s
+                            coefficients_data.extend_from_slice(bytemuck::bytes_of(&vv));
+                            coefficients_data.extend_from_slice(bytemuck::bytes_of(&vvfo));
+                            coefficients_data.extend_from_slice(bytemuck::bytes_of(&vvfn));
+                            coefficients_data.extend_from_slice(bytemuck::bytes_of(&ii));
+                            coefficients_data.extend_from_slice(bytemuck::bytes_of(&iifo));
+                            coefficients_data.extend_from_slice(bytemuck::bytes_of(&iifn));
+
+                            // Flux storage (initialized to zero)
+                            let zero_flux = [0.0f32; 2]; // volt_flux, curr_flux
+                            flux_data.extend_from_slice(bytemuck::bytes_of(&zero_flux));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Generate WGSL shader code for PML
+        let shader_code = Self::generate_pml_shader(self.regions.len());
+
+        Some(crate::extensions::GpuExtensionData {
+            shader_code,
+            buffers: vec![
+                crate::extensions::GpuBufferDescriptor {
+                    label: "PML Metadata".to_string(),
+                    data: metadata_data,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    binding: 11,
+                },
+                crate::extensions::GpuBufferDescriptor {
+                    label: "PML Coefficients".to_string(),
+                    data: coefficients_data,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    binding: 12,
+                },
+                crate::extensions::GpuBufferDescriptor {
+                    label: "PML Flux".to_string(),
+                    data: flux_data,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    binding: 13,
+                },
+            ],
+            bind_group_entries: vec![
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        })
+    }
+
+    /// Generate WGSL shader code for PML update.
+    fn generate_pml_shader(num_regions: usize) -> String {
+        format!(
+            r#"
+// PML Extension Declarations
+struct PmlRegionMeta {{
+    start: vec3<u32>,
+    size: vec3<u32>,
+    direction: u32,
+    padding: u32,
+}}
+
+@group(0) @binding(11) var<storage, read> pml_metadata: array<PmlRegionMeta>;
+@group(0) @binding(12) var<storage, read> pml_coeffs: array<f32>;  // [vv, vvfo, vvfn, ii, iifo, iifn] per cell per component
+@group(0) @binding(13) var<storage, read_write> pml_flux: array<f32>;  // [volt_flux, curr_flux] per cell per component
+
+const PML_NUM_REGIONS: u32 = {}u;
+
+// Check if a global position is within a PML region
+fn is_in_pml_region(region_idx: u32, gi: u32, gj: u32, gk: u32) -> bool {{
+    let meta = pml_metadata[region_idx];
+    return gi >= meta.start.x && gi < meta.start.x + meta.size.x &&
+           gj >= meta.start.y && gj < meta.start.y + meta.size.y &&
+           gk >= meta.start.z && gk < meta.start.z + meta.size.z;
+}}
+
+// Get local index within a PML region
+fn pml_local_idx(region_idx: u32, gi: u32, gj: u32, gk: u32, component: u32) -> u32 {{
+    let meta = pml_metadata[region_idx];
+    let li = gi - meta.start.x;
+    let lj = gj - meta.start.y;
+    let lk = gk - meta.start.z;
+    return ((region_idx * meta.size.x * meta.size.y * meta.size.z) +
+            (lk * meta.size.x * meta.size.y) +
+            (lj * meta.size.x) +
+            li) * 3u + component;
+}}
+
+// Get coefficient offset for a cell/component
+fn pml_coeff_offset(cell_idx: u32) -> u32 {{
+    return cell_idx * 6u;  // 6 coefficients per cell per component
+}}
+
+// Get flux offset for a cell/component
+fn pml_flux_offset(cell_idx: u32) -> u32 {{
+    return cell_idx * 2u;  // 2 flux values per cell per component
+}}
+"#,
+            num_regions
+        )
+    }
 }
 
 // Keep the old Pml struct for backwards compatibility

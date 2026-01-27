@@ -3,6 +3,7 @@ mod tests {
     use openems::arrays::VectorField3D;
     use openems::fdtd::gpu_engine::GpuEngine;
     use openems::fdtd::BoundaryConditions;
+    use openems::fdtd::EngineImpl;
     use openems::fdtd::Operator;
     use openems::geometry::{CoordinateSystem, Grid};
 
@@ -25,7 +26,7 @@ mod tests {
 
         let grid = create_test_grid();
         let operator = Operator::new(grid, BoundaryConditions::default()).unwrap();
-        let engine = GpuEngine::new(&operator);
+        let engine = GpuEngine::new(&operator).unwrap();
 
         let dims = operator.dimensions();
         let mut e_field = VectorField3D::new(dims);
@@ -81,7 +82,7 @@ mod tests {
         // Add a "lossy" region to trigger f32 path if logic works
         operator.set_material(2.0, 1.0, 1.0, 0.0, (1, 4, 1, 4, 1, 4));
 
-        let engine = GpuEngine::new(&operator);
+        let engine = GpuEngine::new(&operator).unwrap();
 
         let dims = operator.dimensions();
         let mut e_field = VectorField3D::new(dims);

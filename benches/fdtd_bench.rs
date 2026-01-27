@@ -3,7 +3,10 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
 use openems::arrays::Dimensions;
-use openems::fdtd::{BoundaryConditions, Engine, EngineType, Operator};
+use openems::fdtd::{
+    BoundaryConditions, EnergyMonitorConfig, Engine, EngineBatch, EngineType, Operator,
+    TerminationConfig,
+};
 use openems::geometry::Grid;
 
 fn bench_fdtd_step(c: &mut Criterion) {
@@ -24,52 +27,64 @@ fn bench_fdtd_step(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_cells as u64));
         group.sample_size(20); // Reduce sample size for slower/large benchmarks
 
+        // Create a minimal batch configuration for single-step benchmarking
+        #[derive(Debug)]
+        struct NoOpExtension;
+        impl openems::extensions::Extension for NoOpExtension {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn apply_step<E>(&mut self, _engine: &mut E, _step: u64) -> openems::Result<()>
+            where
+                E: openems::fdtd::EngineImpl,
+            {
+                Ok(())
+            }
+        }
+
+        let make_batch = || EngineBatch {
+            num_steps: Some(1),
+            excitations: vec![],
+            extensions: vec![NoOpExtension],
+            termination: TerminationConfig::default(),
+            energy_monitoring: EnergyMonitorConfig::default(),
+        };
+
         // Benchmark basic engine
         group.bench_function("basic", |b| {
-            let mut engine = Engine::new(&op, EngineType::Basic);
+            let mut engine = Engine::new(&op, EngineType::Basic).unwrap();
             b.iter(|| {
-                engine.step(&op).unwrap();
-                // Use black_box to prevent optimization, but don't return the reference
+                engine.run_batch(make_batch()).unwrap();
                 black_box(&engine);
             });
         });
 
         // Benchmark SIMD engine
         group.bench_function("simd", |b| {
-            let mut engine = Engine::new(&op, EngineType::Simd);
+            let mut engine = Engine::new(&op, EngineType::Simd).unwrap();
             b.iter(|| {
-                engine.step(&op).unwrap();
+                engine.run_batch(make_batch()).unwrap();
                 black_box(&engine);
             });
         });
 
         // Benchmark parallel engine
         group.bench_function("parallel", |b| {
-            let mut engine = Engine::new(&op, EngineType::Parallel);
+            let mut engine = Engine::new(&op, EngineType::Parallel).unwrap();
             b.iter(|| {
-                engine.step(&op).unwrap();
+                engine.run_batch(make_batch()).unwrap();
                 black_box(&engine);
             });
         });
 
         // Benchmark GPU engine (if available)
-        // We wrap this in a closure that might panic if no GPU is found,
-        // but typically Engine::new will succeed if there's a fallback or actual GPU.
-        // If it panics, the benchmark harness catches it.
-        // Note: Engine::new for GPU might take time, so we do it outside iter.
-        // If the machine has no GPU support, this might fail, but that's expected.
-        let has_gpu = std::panic::catch_unwind(|| {
-            let _ = Engine::new(&op, EngineType::Gpu);
-        })
-        .is_ok();
+        let has_gpu = openems::fdtd::GpuEngine::is_available();
 
         if has_gpu {
             group.bench_function("gpu", |b| {
-                let mut engine = Engine::new(&op, EngineType::Gpu);
+                let mut engine = Engine::new(&op, EngineType::Gpu).unwrap();
                 b.iter(|| {
-                    engine.step(&op).unwrap();
-                    // Crucial: Wait for GPU to finish!
-                    engine.wait_idle();
+                    engine.run_batch(make_batch()).unwrap();
                     black_box(&engine);
                 });
             });

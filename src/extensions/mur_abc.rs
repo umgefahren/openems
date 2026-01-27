@@ -330,6 +330,175 @@ impl MurAbc {
             face.volt_nypp.fill(0.0);
         }
     }
+
+    /// Generate GPU extension data for shader compilation.
+    ///
+    /// Returns None if Mur ABC is not active.
+    pub fn gpu_data(&self) -> Option<crate::extensions::GpuExtensionData> {
+        if !self.is_active() {
+            return None;
+        }
+
+        // Pack face data for GPU
+        let mut metadata_data: Vec<u8> = Vec::new();
+        let mut coefficients_data: Vec<u8> = Vec::new();
+        let mut storage_data: Vec<u8> = Vec::new();
+
+        // GPU Mur face metadata
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct GpuMurFaceMeta {
+            ny: u32,            // Normal direction
+            nyp: u32,           // First perpendicular direction
+            nypp: u32,          // Second perpendicular direction
+            is_max: u32,        // 1 if max boundary, 0 if min
+            line_nr: u32,       // Boundary line number
+            line_nr_shift: u32, // Neighbor line number
+            size_0: u32,        // Size in first perpendicular direction
+            size_1: u32,        // Size in second perpendicular direction
+        }
+
+        for face in &self.faces {
+            let meta = GpuMurFaceMeta {
+                ny: face.ny as u32,
+                nyp: face.nyp as u32,
+                nypp: face.nypp as u32,
+                is_max: if face.is_max { 1 } else { 0 },
+                line_nr: face.line_nr as u32,
+                line_nr_shift: face.line_nr_shift as u32,
+                size_0: face.size[0] as u32,
+                size_1: face.size[1] as u32,
+            };
+            metadata_data.extend_from_slice(bytemuck::bytes_of(&meta));
+
+            // Pack coefficients (2 per cell: coeff_nyp, coeff_nypp)
+            for i in 0..face.size[0] {
+                for j in 0..face.size[1] {
+                    let idx = face.idx(i, j);
+                    coefficients_data.extend_from_slice(bytemuck::bytes_of(&face.coeff_nyp[idx]));
+                    coefficients_data.extend_from_slice(bytemuck::bytes_of(&face.coeff_nypp[idx]));
+                }
+            }
+
+            // Pack voltage storage (2 per cell: volt_nyp, volt_nypp)
+            for i in 0..face.size[0] {
+                for j in 0..face.size[1] {
+                    let idx = face.idx(i, j);
+                    storage_data.extend_from_slice(bytemuck::bytes_of(&face.volt_nyp[idx]));
+                    storage_data.extend_from_slice(bytemuck::bytes_of(&face.volt_nypp[idx]));
+                }
+            }
+        }
+
+        // Generate WGSL shader code for Mur ABC
+        let shader_code = Self::generate_mur_shader(self.faces.len());
+
+        Some(crate::extensions::GpuExtensionData {
+            shader_code,
+            buffers: vec![
+                crate::extensions::GpuBufferDescriptor {
+                    label: "Mur ABC Metadata".to_string(),
+                    data: metadata_data,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    binding: 14,
+                },
+                crate::extensions::GpuBufferDescriptor {
+                    label: "Mur ABC Coefficients".to_string(),
+                    data: coefficients_data,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    binding: 15,
+                },
+                crate::extensions::GpuBufferDescriptor {
+                    label: "Mur ABC Storage".to_string(),
+                    data: storage_data,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    binding: 16,
+                },
+            ],
+            bind_group_entries: vec![
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        })
+    }
+
+    /// Generate WGSL shader code for Mur ABC update.
+    fn generate_mur_shader(num_faces: usize) -> String {
+        format!(
+            r#"
+// Mur ABC Extension Declarations
+struct MurFaceMeta {{
+    ny: u32,
+    nyp: u32,
+    nypp: u32,
+    is_max: u32,
+    line_nr: u32,
+    line_nr_shift: u32,
+    size_0: u32,
+    size_1: u32,
+}}
+
+@group(0) @binding(14) var<storage, read> mur_metadata: array<MurFaceMeta>;
+@group(0) @binding(15) var<storage, read> mur_coeffs: array<f32>;  // [coeff_nyp, coeff_nypp] per cell
+@group(0) @binding(16) var<storage, read_write> mur_storage: array<f32>;  // [volt_nyp, volt_nypp] per cell
+
+const MUR_NUM_FACES: u32 = {}u;
+
+// Get index within a Mur face's coefficient/storage arrays
+fn mur_face_idx(face_idx: u32, i: u32, j: u32) -> u32 {{
+    var offset: u32 = 0u;
+    for (var f = 0u; f < face_idx; f++) {{
+        let meta = mur_metadata[f];
+        offset += meta.size_0 * meta.size_1 * 2u;  // 2 values per cell
+    }}
+    let meta = mur_metadata[face_idx];
+    return offset + (i * meta.size_1 + j) * 2u;
+}}
+
+// Check if position is on a Mur boundary
+fn is_on_mur_boundary(face_idx: u32, pos: vec3<u32>) -> bool {{
+    let meta = mur_metadata[face_idx];
+    var p = array<u32, 3>(pos.x, pos.y, pos.z);
+
+    if (p[meta.ny] != meta.line_nr) {{
+        return false;
+    }}
+
+    // Check perpendicular range
+    return p[meta.nyp] < meta.size_0 && p[meta.nypp] < meta.size_1;
+}}
+"#,
+            num_faces
+        )
+    }
 }
 
 #[cfg(test)]

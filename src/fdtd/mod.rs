@@ -22,25 +22,45 @@
 //! sim.run().unwrap();
 //! ```
 
+mod basic_engine;
+pub mod batch;
 mod compressed;
 mod cylindrical;
 mod cylindrical_multigrid;
-mod engine;
+mod engine; // Old monolithic engine
+pub mod engine_impl;
 mod engine_interface;
+pub mod engine_testing;
 mod excitation;
 /// GPU-accelerated FDTD engine implementation.
 pub mod gpu_engine;
+/// GPU shader builder for dynamic extension compilation.
+pub mod gpu_shader_builder;
+mod new_engine; // New enum-based engine
 mod operator;
+mod parallel_engine;
+mod simd_engine;
 mod simulation;
 mod timestep;
 
+pub use basic_engine::BasicEngine;
+pub use batch::{
+    BatchResult, EnergyMonitorConfig, EnergySample, EngineBatch, ExcitationWaveform,
+    ScheduledExcitation, TerminationConfig, TerminationReason,
+};
 pub use compressed::{CoefficientSet, CompressedCoefficients, CompressionStats};
 pub use cylindrical::{CylindricalEngine, CylindricalGrid, CylindricalOperator};
 pub use cylindrical_multigrid::{CylindricalMultigrid, MultigridConfig, MultigridLevel};
-pub use engine::Engine;
+pub use engine::Engine as LegacyEngine; // Old monolithic engine (deprecated)
+pub use engine_impl::EngineImpl;
 pub use engine_interface::{EngineInterface, EngineInterfaceMut, InterpolationType};
 pub use excitation::{Excitation, ExcitationType};
+pub use gpu_engine::GpuEngine;
+pub use gpu_shader_builder::{GpuShaderBuilder, ShaderHook, WgslCodeGen};
+pub use new_engine::Engine; // New enum-based engine
 pub use operator::Operator;
+pub use parallel_engine::ParallelEngine;
+pub use simd_engine::SimdEngine;
 pub use simulation::{EndCondition, Simulation, SimulationStats};
 pub use timestep::TimestepInfo;
 

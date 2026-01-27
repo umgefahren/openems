@@ -239,6 +239,7 @@ impl IndexMut<(usize, usize, usize)> for Field3D {
 }
 
 /// 3D vector field (stores all three components).
+#[derive(Clone)]
 pub struct VectorField3D {
     /// X component
     pub x: Field3D,

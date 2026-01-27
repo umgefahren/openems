@@ -42,6 +42,14 @@ fn main() {
     // Warm up the CPU
     let _ = benchmark_engine(20, 10, EngineType::Parallel);
 
+    // Check GPU availability
+    let gpu_available = openems::fdtd::GpuEngine::is_available();
+    if gpu_available {
+        println!("GPU acceleration: Available");
+    } else {
+        println!("GPU acceleration: Not available");
+    }
+
     // Run benchmarks for different grid sizes
     for &size in &[50, 100, 150] {
         println!(
@@ -67,6 +75,15 @@ fn main() {
             "  Parallel speedup over Basic: {:.2}x",
             parallel_speed / basic_speed
         );
+
+        if gpu_available {
+            let gpu_speed = benchmark_engine(size, timesteps, EngineType::Gpu);
+            println!("  GPU speedup over Basic: {:.2}x", gpu_speed / basic_speed);
+            println!(
+                "  GPU speedup over Parallel: {:.2}x",
+                gpu_speed / parallel_speed
+            );
+        }
     }
 
     println!("\nDone!");

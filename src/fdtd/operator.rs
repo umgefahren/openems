@@ -213,7 +213,8 @@ impl Operator {
         let loss_m = sigma_m * dt / (2.0 * mu);
         let da_mat = ((1.0 - loss_m) / (1.0 + loss_m)) as f32;
 
-        let db_factor = (dt / mu) / (1.0 + loss_m);
+        // Note: db coefficients are negative (H update equation has a minus sign)
+        let db_factor = -(dt / mu) / (1.0 + loss_m);
         let db_x = (db_factor / dx) as f32;
         let db_y = (db_factor / dy) as f32;
         let db_z = (db_factor / dz) as f32;

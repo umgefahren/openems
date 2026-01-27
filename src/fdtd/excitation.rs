@@ -118,6 +118,22 @@ impl Excitation {
         }
     }
 
+    /// Create a Dirac delta (impulse) excitation.
+    ///
+    /// # Arguments
+    /// * `amplitude` - Amplitude of the impulse
+    /// * `direction` - Polarization direction (0=x, 1=y, 2=z)
+    /// * `position` - Source position (i, j, k)
+    pub fn dirac(amplitude: f64, direction: usize, position: (usize, usize, usize)) -> Self {
+        Self {
+            excitation_type: ExcitationType::Dirac,
+            direction,
+            position,
+            amplitude,
+            soft_source: true,
+        }
+    }
+
     /// Set the amplitude.
     pub fn with_amplitude(mut self, amplitude: f64) -> Self {
         self.amplitude = amplitude;

@@ -80,9 +80,14 @@ hdf5 = ["hdf5-metno"]
 criterion = "0.5"
 approx = "0.5"
 tempfile = "3.10"
+paste = "1.0"
 
 [[bench]]
 name = "fdtd_bench"
+harness = false
+
+[[bench]]
+name = "holistic_bench"
 harness = false
 
 [profile.release]

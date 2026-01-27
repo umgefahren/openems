@@ -20,6 +20,27 @@ override nz: u32;
 @group(0) @binding(5) var<storage, read> h_coeff_f16: array<vec4<float16>>;
 @group(0) @binding(6) var<storage, read> h_coeff_f32: array<vec4<f32>>;
 
+// Excitation data
+struct ExcitationPoint {
+    position: vec3<u32>,  // (i, j, k)
+    direction: u32,        // 0=x, 1=y, 2=z
+    value: f32,            // Field value to apply
+    soft_source: u32,      // 0=hard, 1=soft
+    _padding: vec2<u32>,   // Padding to align to 32 bytes
+}
+
+@group(0) @binding(7) var<storage, read> excitations: array<ExcitationPoint>;
+@group(0) @binding(8) var<storage, read> excitation_offsets: array<u32>;  // Start index for each timestep
+
+// Timestep uniform (updated each step via CPU write)
+struct TimestepUniform {
+    current_timestep: u32,
+}
+@group(0) @binding(9) var<uniform> timestep_data: TimestepUniform;
+
+// Energy reduction output buffer
+@group(0) @binding(10) var<storage, read_write> energy_output: array<f32>;
+
 fn get_idx(x: u32, y: u32, z: u32) -> u32 {
     return x * ny * nz + y * nz + z;
 }
@@ -227,5 +248,74 @@ fn update_e(@builtin(global_invocation_id) global_id: vec3<u32>) {
         
         let ez_idx = 2u * total + idx;
         e_field[ez_idx] = fma(cb_z, curl_z, ca_z * e_field[ez_idx]);
+    }
+
+    // Apply excitations for this timestep
+    // Only the first thread in the workgroup applies excitations to avoid race conditions
+    if (global_id.x == 0u && global_id.y == 0u && global_id.z == 0u) {
+        let ts = timestep_data.current_timestep;
+        let exc_start = excitation_offsets[ts];
+        let exc_end = excitation_offsets[ts + 1u];
+
+        for (var exc_idx = exc_start; exc_idx < exc_end; exc_idx++) {
+            let exc = excitations[exc_idx];
+            let exc_linear_idx = get_idx(exc.position.x, exc.position.y, exc.position.z);
+            let field_idx = exc.direction * total + exc_linear_idx;
+
+            if (exc.soft_source != 0u) {
+                e_field[field_idx] += exc.value;
+            } else {
+                e_field[field_idx] = exc.value;
+            }
+        }
+    }
+}
+
+// Energy reduction compute shader
+// Uses workgroup reduction to compute total E and H field energy
+var<workgroup> e_partial: array<f32, 64>;
+var<workgroup> h_partial: array<f32, 64>;
+
+@compute @workgroup_size(64, 1, 1)
+fn compute_energy(@builtin(global_invocation_id) global_id: vec3<u32>,
+                  @builtin(local_invocation_id) local_id: vec3<u32>,
+                  @builtin(workgroup_id) wg_id: vec3<u32>,
+                  @builtin(num_workgroups) num_wgs: vec3<u32>) {
+    let total = nx * ny * nz;
+    let total_threads = num_wgs.x * 64u;
+    let global_thread_id = wg_id.x * 64u + local_id.x;
+
+    // Each thread computes partial sum over its assigned range
+    var e_sum: f32 = 0.0;
+    var h_sum: f32 = 0.0;
+
+    // Stride through field data
+    var idx = global_thread_id;
+    while (idx < total * 3u) {
+        let e_val = e_field[idx];
+        let h_val = h_field[idx];
+        e_sum += e_val * e_val;
+        h_sum += h_val * h_val;
+        idx += total_threads;
+    }
+
+    // Store in workgroup shared memory
+    e_partial[local_id.x] = e_sum;
+    h_partial[local_id.x] = h_sum;
+    workgroupBarrier();
+
+    // Reduction within workgroup (sequential addressing)
+    for (var stride = 32u; stride > 0u; stride >>= 1u) {
+        if (local_id.x < stride) {
+            e_partial[local_id.x] += e_partial[local_id.x + stride];
+            h_partial[local_id.x] += h_partial[local_id.x + stride];
+        }
+        workgroupBarrier();
+    }
+
+    // First thread writes workgroup result
+    if (local_id.x == 0u) {
+        energy_output[wg_id.x * 2u] = e_partial[0];
+        energy_output[wg_id.x * 2u + 1u] = h_partial[0];
     }
 }

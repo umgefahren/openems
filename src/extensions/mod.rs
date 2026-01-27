@@ -12,12 +12,18 @@
 
 mod conducting_sheet;
 mod dispersive;
+mod extension_trait;
 mod local_absorbing_bc;
 mod lumped_rlc;
 mod mur_abc;
 mod pml;
 mod steady_state;
 mod tfsf;
+
+// Extension trait exports
+pub use extension_trait::{
+    AnyExtension, CpuExtensionData, Extension, GpuBufferDescriptor, GpuExtensionData,
+};
 
 // PML exports
 pub use pml::{Pml, PmlBoundaries, PmlBoundary, PmlConfig, Upml};
@@ -32,8 +38,8 @@ pub use local_absorbing_bc::{
 
 // Dispersive material exports
 pub use dispersive::{
-    DebyeMaterial, DebyeParams, DispersiveMaterial, DrudeMaterial, DrudeParams, LorentzMaterial,
-    LorentzParams,
+    DebyeMaterial, DebyeParams, DispersiveMaterial, DispersiveType, DrudeMaterial, DrudeParams,
+    LorentzMaterial, LorentzParams,
 };
 
 // Lumped RLC exports

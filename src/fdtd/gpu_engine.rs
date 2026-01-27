@@ -1,24 +1,50 @@
 use crate::arrays::{Dimensions, VectorField3D};
+use crate::fdtd::batch::{BatchResult, EnergySample, EngineBatch, TerminationReason};
+use crate::fdtd::engine_impl::EngineImpl;
 use crate::fdtd::operator::Operator;
+use crate::Result;
 use half::f16;
+use instant::Instant;
 use std::borrow::Cow;
 use wgpu::util::DeviceExt;
 
-/// GPU-accelerated FDTD engine using WebGPU.
+/// GPU-accelerated FDTD engine using WebGPU with batching support.
 pub struct GpuEngine {
     instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     update_h_pipeline: wgpu::ComputePipeline,
     update_e_pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
 
-    // Buffers
+    // Core field buffers
     e_field_buffer: wgpu::Buffer,
     h_field_buffer: wgpu::Buffer,
 
+    // Coefficient buffers (stored for bind group recreation)
+    e_coeff_f16_buffer: wgpu::Buffer,
+    e_coeff_f32_buffer: wgpu::Buffer,
+    h_coeff_f16_buffer: wgpu::Buffer,
+    h_coeff_f32_buffer: wgpu::Buffer,
+    cell_class_buffer: wgpu::Buffer,
+
+    // Excitation buffers (dynamically resized per batch)
+    excitation_buffer: wgpu::Buffer,
+    excitation_offsets_buffer: wgpu::Buffer,
+    timestep_buffer: wgpu::Buffer,
+    max_excitations: usize,
+    max_timesteps: usize,
+
+    // Energy reduction buffers
+    energy_partial_buffer: wgpu::Buffer,
+    energy_staging_buffer: wgpu::Buffer,
+    energy_pipeline: wgpu::ComputePipeline,
+    num_energy_workgroups: usize,
+
     // Dimensions
     dims: Dimensions,
+    dt: f64,
 
     // Workgroup dispatch size
     dispatch_x: u32,
@@ -26,8 +52,13 @@ pub struct GpuEngine {
     dispatch_z: u32,
 
     // State
+    timestep: u64,
     #[allow(dead_code)]
     supports_f16: bool,
+
+    // Field cache (avoid unnecessary GPU↔CPU transfers)
+    field_cache: Option<(VectorField3D, VectorField3D)>,
+    cache_dirty: bool,
 }
 
 impl GpuEngine {
@@ -44,9 +75,10 @@ impl GpuEngine {
     }
 
     /// Create a new GPU engine.
-    pub fn new(operator: &Operator) -> Self {
+    pub fn new_internal(operator: &Operator) -> Self {
         let dims = operator.dimensions();
         let total = dims.total();
+        let dt = operator.timestep();
 
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -263,6 +295,51 @@ impl GpuEngine {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
+        // Create initial excitation buffers (small default, will be resized per batch)
+        let initial_max_excitations = 16;
+        let initial_max_timesteps = 1024;
+
+        let excitation_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Excitation Buffer"),
+            // ExcitationPoint: position (3 u32) + direction (u32) + value (f32) + soft_source (u32) = 24 bytes
+            size: (initial_max_excitations * initial_max_timesteps * 24) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let excitation_offsets_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Excitation Offsets Buffer"),
+            // One offset per timestep + 1 for end sentinel
+            size: ((initial_max_timesteps + 1) * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Timestep uniform buffer (updated each step)
+        let timestep_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Timestep Uniform Buffer"),
+            size: 4, // u32
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Energy reduction buffers (created early so they can be added to bind group)
+        // We use 256 workgroups for reduction, each outputs 2 f32s (e_energy, h_energy)
+        let num_energy_workgroups = 256usize;
+        let energy_partial_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Energy Partial Buffer"),
+            size: (num_energy_workgroups * 2 * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let energy_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Energy Staging Buffer"),
+            size: (num_energy_workgroups * 2 * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("FDTD Bind Group Layout"),
             entries: &[
@@ -343,6 +420,50 @@ impl GpuEngine {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    // Excitations
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    // Excitation Offsets
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    // Timestep uniform
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    // Energy output
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -378,9 +499,26 @@ impl GpuEngine {
                     binding: 6,
                     resource: h_coeff_f32_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: excitation_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: excitation_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: timestep_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: energy_partial_buffer.as_entire_binding(),
+                },
             ],
         });
 
+        // Create pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
@@ -417,6 +555,19 @@ impl GpuEngine {
             cache: None,
         });
 
+        // Energy reduction pipeline
+        let energy_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Energy Reduction Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("compute_energy"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants_data,
+                ..Default::default()
+            },
+            cache: None,
+        });
+
         // Dispatch dimensions swapped to match shader mapping:
         // GlobalID.x -> k (fastest mem) -> dispatch_x covers nz (ILP=4)
         // GlobalID.y -> j -> dispatch_y covers ny
@@ -437,14 +588,56 @@ impl GpuEngine {
             queue,
             update_h_pipeline,
             update_e_pipeline,
+            bind_group_layout,
             bind_group,
             e_field_buffer,
             h_field_buffer,
+            e_coeff_f16_buffer,
+            e_coeff_f32_buffer,
+            h_coeff_f16_buffer,
+            h_coeff_f32_buffer,
+            cell_class_buffer,
+            excitation_buffer,
+            excitation_offsets_buffer,
+            timestep_buffer,
+            max_excitations: initial_max_excitations,
+            max_timesteps: initial_max_timesteps,
+            energy_partial_buffer,
+            energy_staging_buffer,
+            energy_pipeline,
+            num_energy_workgroups,
             dims,
+            dt,
             dispatch_x,
             dispatch_y,
             dispatch_z,
+            timestep: 0,
             supports_f16,
+            field_cache: None,
+            cache_dirty: false,
+        }
+    }
+
+    /// Synchronize fields from GPU to CPU cache.
+    fn sync_fields_from_gpu(&mut self) {
+        if self.cache_dirty || self.field_cache.is_none() {
+            let mut e_field = VectorField3D::new(self.dims);
+            let mut h_field = VectorField3D::new(self.dims);
+
+            self.read_buffer_to_field(&self.e_field_buffer, &mut e_field);
+            self.read_buffer_to_field(&self.h_field_buffer, &mut h_field);
+
+            self.field_cache = Some((e_field, h_field));
+            self.cache_dirty = false;
+        }
+    }
+
+    /// Synchronize fields from CPU cache to GPU.
+    fn sync_fields_to_gpu(&mut self) {
+        if let Some((ref e_field, ref h_field)) = self.field_cache {
+            self.write_e_field(e_field);
+            self.write_h_field(h_field);
+            self.cache_dirty = false;
         }
     }
 
@@ -584,8 +777,415 @@ impl GpuEngine {
         self.queue.submit(Some(encoder.finish()));
     }
 
+    /// Upload excitation schedule to GPU for the entire batch.
+    ///
+    /// This pre-uploads all excitation data, eliminating per-timestep CPU→GPU transfers.
+    fn upload_excitation_schedule(
+        &mut self,
+        excitations: &[crate::fdtd::batch::ScheduledExcitation],
+        num_timesteps: u64,
+    ) {
+        // GPU ExcitationPoint: position (3 u32) + direction (u32) + value (f32) + soft_source (u32) + padding (2 u32) = 32 bytes
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct GpuExcitationPoint {
+            pos_x: u32,
+            pos_y: u32,
+            pos_z: u32,
+            direction: u32,
+            value: f32,
+            soft_source: u32,
+            _padding: [u32; 2],
+        }
+
+        // Build per-timestep excitation lists
+        let mut timestep_excitations: Vec<Vec<GpuExcitationPoint>> =
+            vec![Vec::new(); num_timesteps as usize];
+
+        for exc in excitations {
+            if let crate::fdtd::batch::ExcitationWaveform::Sampled(ref samples) = exc.waveform {
+                for (step, &value) in samples.iter().enumerate() {
+                    if (step as u64) < num_timesteps && value.abs() > 1e-12 {
+                        timestep_excitations[step].push(GpuExcitationPoint {
+                            pos_x: exc.position.0 as u32,
+                            pos_y: exc.position.1 as u32,
+                            pos_z: exc.position.2 as u32,
+                            direction: exc.direction as u32,
+                            value,
+                            soft_source: if exc.soft_source { 1 } else { 0 },
+                            _padding: [0, 0],
+                        });
+                    }
+                }
+            }
+        }
+
+        // Flatten into linear buffer with offset array
+        let mut all_excitations: Vec<GpuExcitationPoint> = Vec::new();
+        let mut offsets: Vec<u32> = Vec::with_capacity(num_timesteps as usize + 1);
+
+        for ts_excs in &timestep_excitations {
+            offsets.push(all_excitations.len() as u32);
+            all_excitations.extend_from_slice(ts_excs);
+        }
+        offsets.push(all_excitations.len() as u32); // End sentinel
+
+        // Check if we need to resize buffers
+        let total_excitations = all_excitations.len();
+        if total_excitations > self.max_excitations * self.max_timesteps
+            || (num_timesteps as usize + 1) > self.max_timesteps + 1
+        {
+            // Resize buffers
+            let new_max_excitations = total_excitations.max(16);
+            let new_max_timesteps = (num_timesteps as usize + 1).max(1024);
+
+            self.excitation_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Excitation Buffer (resized)"),
+                size: (new_max_excitations * 32) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            self.excitation_offsets_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Excitation Offsets Buffer (resized)"),
+                size: (new_max_timesteps * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            self.max_excitations = new_max_excitations;
+            self.max_timesteps = new_max_timesteps;
+
+            // Recreate bind group with new buffers
+            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("FDTD Bind Group (resized)"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.e_field_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.h_field_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.e_coeff_f16_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.e_coeff_f32_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.cell_class_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: self.h_coeff_f16_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: self.h_coeff_f32_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: self.excitation_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: self.excitation_offsets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: self.timestep_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: self.energy_partial_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        }
+
+        // Upload data
+        if !all_excitations.is_empty() {
+            self.queue.write_buffer(
+                &self.excitation_buffer,
+                0,
+                bytemuck::cast_slice(&all_excitations),
+            );
+        }
+        self.queue.write_buffer(
+            &self.excitation_offsets_buffer,
+            0,
+            bytemuck::cast_slice(&offsets),
+        );
+    }
+
+    /// Update the timestep uniform buffer on GPU.
+    fn set_gpu_timestep(&self, timestep: u32) {
+        self.queue
+            .write_buffer(&self.timestep_buffer, 0, bytemuck::bytes_of(&timestep));
+    }
+
+    /// Compute energy using GPU reduction (async-capable).
+    ///
+    /// Returns (e_energy, h_energy) without blocking with wait_idle().
+    fn compute_energy_gpu(&self, encoder: &mut wgpu::CommandEncoder) {
+        // Dispatch energy reduction
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Energy Reduction Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.energy_pipeline);
+            compute_pass.set_bind_group(0, &self.bind_group, &[]);
+            compute_pass.dispatch_workgroups(self.num_energy_workgroups as u32, 1, 1);
+        }
+
+        // Copy partial results to staging buffer
+        encoder.copy_buffer_to_buffer(
+            &self.energy_partial_buffer,
+            0,
+            &self.energy_staging_buffer,
+            0,
+            self.energy_staging_buffer.size(),
+        );
+    }
+
+    /// Read back energy from staging buffer and compute final sum.
+    ///
+    /// This should be called after compute_energy_gpu and after submitting commands.
+    fn read_energy_result(&self) -> (f64, f64) {
+        let slice = self.energy_staging_buffer.slice(..);
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+
+        self.instance.poll_all(true);
+        pollster::block_on(receiver).unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+
+        // Sum up partial results (each workgroup contributed [e_partial, h_partial])
+        let mut e_energy = 0.0f64;
+        let mut h_energy = 0.0f64;
+        for i in 0..self.num_energy_workgroups {
+            e_energy += floats[i * 2] as f64;
+            h_energy += floats[i * 2 + 1] as f64;
+        }
+
+        drop(data);
+        self.energy_staging_buffer.unmap();
+
+        (e_energy, h_energy)
+    }
+
     /// Wait for all GPU operations to complete.
     pub fn wait_idle(&self) {
         self.instance.poll_all(true);
+    }
+
+    /// Compute energy on CPU (GPU energy reduction not yet implemented).
+    fn compute_energy_cpu(&mut self) -> (f64, f64) {
+        self.sync_fields_from_gpu();
+        let (e_field, h_field) = self.field_cache.as_ref().unwrap();
+        let e_energy = e_field.energy();
+        let h_energy = h_field.energy();
+        (e_energy, h_energy)
+    }
+}
+
+impl EngineImpl for GpuEngine {
+    fn new(operator: &Operator) -> Result<Self> {
+        Ok(Self::new_internal(operator))
+    }
+
+    fn run_batch<E>(&mut self, batch: EngineBatch<E>) -> Result<BatchResult>
+    where
+        E: crate::extensions::Extension,
+    {
+        let start = Instant::now();
+        let mut energy_samples = Vec::new();
+        let mut peak_energy = 0.0;
+
+        // Pre-batch: sync fields to GPU if cache exists
+        self.sync_fields_to_gpu();
+
+        // Extensions pre-batch (CPU-side only for now)
+        // TODO: Implement GPU extension compilation
+        for ext in &batch.extensions {
+            // GPU doesn't support extensions yet - would need shader compilation
+            if ext.gpu_data().is_some() {
+                log::warn!(
+                    "GPU extensions not yet implemented, extension {} will be ignored",
+                    ext.name()
+                );
+            }
+        }
+
+        let num_steps = batch.num_steps.unwrap_or(1000);
+
+        // Pre-upload excitation schedule to GPU (eliminates per-timestep transfers)
+        self.upload_excitation_schedule(&batch.excitations, num_steps);
+
+        // Determine energy sampling strategy
+        let use_gpu_energy = batch.energy_monitoring.sample_interval > 0;
+        let sample_interval = if use_gpu_energy {
+            batch.energy_monitoring.sample_interval
+        } else {
+            // If no sampling, use a large interval to avoid branches
+            u64::MAX
+        };
+
+        // Process timesteps in chunks for energy sampling
+        let mut step = 0u64;
+        while step < num_steps {
+            // Calculate how many steps until next energy sample (or end of batch)
+            let steps_until_sample = if sample_interval < u64::MAX {
+                sample_interval - (step % sample_interval)
+            } else {
+                num_steps - step
+            };
+            let chunk_end = (step + steps_until_sample).min(num_steps);
+
+            // Encode chunk as single command buffer
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Batch Encoder"),
+                });
+
+            for s in step..chunk_end {
+                // Update timestep uniform for excitation lookup
+                self.set_gpu_timestep(s as u32);
+
+                // Encode H update
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Update H Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_pipeline(&self.update_h_pipeline);
+                    compute_pass.set_bind_group(0, &self.bind_group, &[]);
+                    compute_pass.dispatch_workgroups(
+                        self.dispatch_x,
+                        self.dispatch_y,
+                        self.dispatch_z,
+                    );
+                }
+
+                // Encode E update (includes excitation application in shader)
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Update E Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_pipeline(&self.update_e_pipeline);
+                    compute_pass.set_bind_group(0, &self.bind_group, &[]);
+                    compute_pass.dispatch_workgroups(
+                        self.dispatch_x,
+                        self.dispatch_y,
+                        self.dispatch_z,
+                    );
+                }
+
+                self.timestep += 1;
+            }
+
+            // Energy sampling at chunk boundaries (uses GPU reduction)
+            if use_gpu_energy && chunk_end % sample_interval == 0 && chunk_end < num_steps {
+                // Add GPU energy computation to the command buffer
+                self.compute_energy_gpu(&mut encoder);
+
+                // Submit and wait for results
+                self.queue.submit(Some(encoder.finish()));
+
+                // Read energy from staging buffer
+                let (e_energy, h_energy) = self.read_energy_result();
+                let total_energy = e_energy + h_energy;
+
+                if total_energy > peak_energy {
+                    peak_energy = total_energy;
+                }
+
+                energy_samples.push(EnergySample {
+                    timestep: self.timestep,
+                    e_energy,
+                    h_energy,
+                    total_energy,
+                });
+
+                // Check energy decay termination
+                if let Some(threshold) = batch.termination.energy_decay_db {
+                    if peak_energy > 0.0 {
+                        let decay_db = 10.0 * (total_energy / peak_energy).log10();
+                        if decay_db < threshold {
+                            self.cache_dirty = true;
+                            return Ok(BatchResult {
+                                timesteps_executed: chunk_end,
+                                termination_reason: TerminationReason::EnergyDecay {
+                                    final_decay_db: decay_db,
+                                },
+                                energy_samples,
+                                elapsed_time: start.elapsed(),
+                            });
+                        }
+                    }
+                }
+            } else {
+                // No energy sampling, just submit
+                self.queue.submit(Some(encoder.finish()));
+            }
+
+            step = chunk_end;
+        }
+
+        // Final wait for completion
+        self.wait_idle();
+        self.cache_dirty = true;
+
+        Ok(BatchResult {
+            timesteps_executed: num_steps,
+            termination_reason: TerminationReason::StepsCompleted,
+            energy_samples,
+            elapsed_time: start.elapsed(),
+        })
+    }
+
+    fn current_timestep(&self) -> u64 {
+        self.timestep
+    }
+
+    fn read_fields(&mut self) -> (&VectorField3D, &VectorField3D) {
+        self.sync_fields_from_gpu();
+        let (ref e_field, ref h_field) = self.field_cache.as_ref().unwrap();
+        (e_field, h_field)
+    }
+
+    fn write_fields(&mut self) -> (&mut VectorField3D, &mut VectorField3D) {
+        self.sync_fields_from_gpu();
+        self.cache_dirty = true; // Mark for re-upload
+        let (ref mut e_field, ref mut h_field) = self.field_cache.as_mut().unwrap();
+        (e_field, h_field)
+    }
+
+    fn reset(&mut self) {
+        let size = self.e_field_buffer.size();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.clear_buffer(&self.e_field_buffer, 0, Some(size));
+        encoder.clear_buffer(&self.h_field_buffer, 0, Some(size));
+        self.queue.submit(Some(encoder.finish()));
+        self.wait_idle();
+
+        self.timestep = 0;
+        self.field_cache = None;
+        self.cache_dirty = false;
     }
 }
