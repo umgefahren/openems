@@ -140,8 +140,8 @@ fn update_h(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let ez_jp1_val = select(0.0, e_field[2u * total + get_idx(i, j + 1u, k)] - ez_curr, j + 1u < ny);
         let dez_dy = ez_jp1_val;
 
-        // Reuse Ey values from registers
-        let dey_dz = ey_vals[u + 1u] - ey_vals[u]; // No need for explicit k+1 check, handled by load loop
+        // Reuse Ey values from registers, but need boundary check
+        let dey_dz = select(0.0, ey_vals[u + 1u] - ey_vals[u], k + 1u < nz);
 
         let curl_x = dez_dy - dey_dz;
         let hx_idx = 0u * total + idx;
@@ -174,12 +174,13 @@ fn update_e(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let k_base = global_id.x * 4u;
     let j = global_id.y;
     let i = global_id.z;
+    let total = nx * ny * nz;
 
+    // Boundary check for main FDTD update
     if (i < 1u || i >= nx || j < 1u || j >= ny || k_base >= nz) {
         return;
     }
 
-    let total = nx * ny * nz;
     let idx_base = get_idx(i, j, k_base);
 
     // Pre-load Hy for register reuse
@@ -249,33 +250,23 @@ fn update_e(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let ez_idx = 2u * total + idx;
         e_field[ez_idx] = fma(cb_z, curl_z, ca_z * e_field[ez_idx]);
     }
-
-    // Apply excitations for this timestep
-    // Use thread (0, 1, 1) since (0, 0, 0) returns early due to boundary check
-    // (global_id.z=1 means i=1, global_id.y=1 means j=1, global_id.x=0 means k_base=0)
-    if (global_id.x == 0u && global_id.y == 1u && global_id.z == 1u) {
-        let ts = timestep_data.current_timestep;
-        let exc_start = excitation_offsets[ts];
-        let exc_end = excitation_offsets[ts + 1u];
-
-        for (var exc_idx = exc_start; exc_idx < exc_end; exc_idx++) {
-            let exc = excitations[exc_idx];
-            let exc_linear_idx = get_idx(exc.position.x, exc.position.y, exc.position.z);
-            let field_idx = exc.direction * total + exc_linear_idx;
-
-            if (exc.soft_source != 0u) {
-                e_field[field_idx] += exc.value;
-            } else {
-                e_field[field_idx] = exc.value;
-            }
-        }
-    }
 }
 
 // Energy reduction compute shader
-// Uses workgroup reduction to compute total E and H field energy
+// Uses workgroup reduction with Kahan summation for numerical stability.
+// Kahan summation tracks and compensates for rounding errors, reducing
+// error from O(n*eps) to O(eps) where eps is machine epsilon.
 var<workgroup> e_partial: array<f32, 64>;
 var<workgroup> h_partial: array<f32, 64>;
+
+// Kahan summation: add value to sum while tracking compensation
+// Returns the new sum; updates compensation in-place
+fn kahan_add(sum: f32, value: f32, compensation: ptr<function, f32>) -> f32 {
+    let y = value - *compensation;        // Compensated value
+    let t = sum + y;                       // New sum (with rounding error)
+    *compensation = (t - sum) - y;         // Recover rounding error for next iteration
+    return t;
+}
 
 @compute @workgroup_size(64, 1, 1)
 fn compute_energy(@builtin(global_invocation_id) global_id: vec3<u32>,
@@ -286,17 +277,19 @@ fn compute_energy(@builtin(global_invocation_id) global_id: vec3<u32>,
     let total_threads = num_wgs.x * 64u;
     let global_thread_id = wg_id.x * 64u + local_id.x;
 
-    // Each thread computes partial sum over its assigned range
+    // Each thread computes partial sum using Kahan summation
     var e_sum: f32 = 0.0;
     var h_sum: f32 = 0.0;
+    var e_comp: f32 = 0.0;  // Kahan compensation for E
+    var h_comp: f32 = 0.0;  // Kahan compensation for H
 
     // Stride through field data
     var idx = global_thread_id;
     while (idx < total * 3u) {
         let e_val = e_field[idx];
         let h_val = h_field[idx];
-        e_sum += e_val * e_val;
-        h_sum += h_val * h_val;
+        e_sum = kahan_add(e_sum, e_val * e_val, &e_comp);
+        h_sum = kahan_add(h_sum, h_val * h_val, &h_comp);
         idx += total_threads;
     }
 
@@ -306,6 +299,7 @@ fn compute_energy(@builtin(global_invocation_id) global_id: vec3<u32>,
     workgroupBarrier();
 
     // Reduction within workgroup (sequential addressing)
+    // Note: Using simple addition for reduction phase as values are similar magnitude
     for (var stride = 32u; stride > 0u; stride >>= 1u) {
         if (local_id.x < stride) {
             e_partial[local_id.x] += e_partial[local_id.x + stride];
@@ -318,5 +312,33 @@ fn compute_energy(@builtin(global_invocation_id) global_id: vec3<u32>,
     if (local_id.x == 0u) {
         energy_output[wg_id.x * 2u] = e_partial[0];
         energy_output[wg_id.x * 2u + 1u] = h_partial[0];
+    }
+}
+
+// Apply excitations to E-field
+// CRITICAL: Must be called AFTER update_e to match BasicEngine behavior
+// Single-threaded to avoid race conditions
+@compute @workgroup_size(1, 1, 1)
+fn apply_excitations(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    // Only thread (0,0,0) does work
+    if (global_id.x != 0u || global_id.y != 0u || global_id.z != 0u) {
+        return;
+    }
+
+    let total = nx * ny * nz;
+    let ts = timestep_data.current_timestep;
+    let exc_start = excitation_offsets[ts];
+    let exc_end = excitation_offsets[ts + 1u];
+
+    for (var exc_idx = exc_start; exc_idx < exc_end; exc_idx++) {
+        let exc = excitations[exc_idx];
+        let exc_linear_idx = get_idx(exc.position.x, exc.position.y, exc.position.z);
+        let field_idx = exc.direction * total + exc_linear_idx;
+
+        if (exc.soft_source != 0u) {
+            e_field[field_idx] += exc.value;
+        } else {
+            e_field[field_idx] = exc.value;
+        }
     }
 }

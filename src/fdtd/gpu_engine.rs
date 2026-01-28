@@ -15,6 +15,7 @@ pub struct GpuEngine {
     queue: wgpu::Queue,
     update_h_pipeline: wgpu::ComputePipeline,
     update_e_pipeline: wgpu::ComputePipeline,
+    apply_excitations_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
 
@@ -44,7 +45,6 @@ pub struct GpuEngine {
 
     // Dimensions
     dims: Dimensions,
-    dt: f64,
 
     // Workgroup dispatch size
     dispatch_x: u32,
@@ -78,7 +78,6 @@ impl GpuEngine {
     pub fn new_internal(operator: &Operator) -> Self {
         let dims = operator.dimensions();
         let total = dims.total();
-        let dt = operator.timestep();
 
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -163,9 +162,11 @@ impl GpuEngine {
         let mut cell_class_data: Vec<u32> = Vec::with_capacity(total);
 
         // Populate E coefficients
-        for k in 0..dims.nz {
+        // IMPORTANT: Loop order must match shader's get_idx(i,j,k) = i*ny*nz + j*nz + k
+        // This means i varies slowest, j next, k fastest (row-major for x,y,z)
+        for i in 0..dims.nx {
             for j in 0..dims.ny {
-                for i in 0..dims.nx {
+                for k in 0..dims.nz {
                     let ca = [
                         e_coeff.ca[0].get(i, j, k),
                         e_coeff.ca[1].get(i, j, k),
@@ -178,12 +179,10 @@ impl GpuEngine {
                     ];
 
                     // Classify
-                    // Heuristic: Use f32 if Ca != 1.0 (lossy) and Ca != 0.0 (PEC).
-                    // Or if we implement PML later, we mark those regions.
-                    // For now: Standard = 0, HighPrecision = 1.
-                    let is_lossy =
-                        (ca[0] - 1.0).abs() > 1e-5 || (ca[0].abs() > 1e-5 && ca[0] < 0.99);
-                    let class_id = if is_lossy { 1u32 } else { 0u32 };
+                    // Always use f32 (class_id = 1) for precision.
+                    // The f16 path saves memory but has only ~3 decimal digits precision,
+                    // which causes ~1e-2 relative errors compared to CPU engines.
+                    let class_id = 1u32;
                     cell_class_data.push(class_id);
 
                     // Pack data
@@ -243,9 +242,10 @@ impl GpuEngine {
         // Since we already filled cell_class based on E, we might need to update it for H?
         // But H update uses cell_class to choose H coeffs.
 
-        for k in 0..dims.nz {
+        // IMPORTANT: Loop order must match shader's get_idx(i,j,k) = i*ny*nz + j*nz + k
+        for i in 0..dims.nx {
             for j in 0..dims.ny {
-                for i in 0..dims.nx {
+                for k in 0..dims.nz {
                     let da = [
                         h_coeff.da[0].get(i, j, k),
                         h_coeff.da[1].get(i, j, k),
@@ -315,10 +315,11 @@ impl GpuEngine {
             mapped_at_creation: false,
         });
 
-        // Timestep uniform buffer (updated each step)
+        // Timestep uniform buffer (with dynamic offsets for batching)
+        // Each timestep value is in a 256-byte aligned chunk (WebGPU requirement)
         let timestep_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Timestep Uniform Buffer"),
-            size: 4, // u32
+            size: (initial_max_timesteps * 256) as u64,  // 256-byte alignment per timestep
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -443,13 +444,13 @@ impl GpuEngine {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    // Timestep uniform
+                    // Timestep uniform (with dynamic offset for batching)
                     binding: 9,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: Some(std::num::NonZeroU64::new(4).unwrap()),
                     },
                     count: None,
                 },
@@ -509,7 +510,11 @@ impl GpuEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
-                    resource: timestep_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &timestep_buffer,
+                        offset: 0,
+                        size: Some(std::num::NonZeroU64::new(256).unwrap()),
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,
@@ -555,6 +560,18 @@ impl GpuEngine {
             cache: None,
         });
 
+        let apply_excitations_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Apply Excitations Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("apply_excitations"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants_data,
+                ..Default::default()
+            },
+            cache: None,
+        });
+
         // Energy reduction pipeline
         let energy_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Energy Reduction Pipeline"),
@@ -588,6 +605,7 @@ impl GpuEngine {
             queue,
             update_h_pipeline,
             update_e_pipeline,
+            apply_excitations_pipeline,
             bind_group_layout,
             bind_group,
             e_field_buffer,
@@ -607,7 +625,6 @@ impl GpuEngine {
             energy_pipeline,
             num_energy_workgroups,
             dims,
-            dt,
             dispatch_x,
             dispatch_y,
             dispatch_z,
@@ -643,6 +660,11 @@ impl GpuEngine {
 
     /// Perform one FDTD timestep on the GPU.
     pub fn step(&self) {
+        // Upload current timestep value to the first 256-byte chunk
+        let mut timestep_chunk = vec![0u8; 256];
+        timestep_chunk[0..4].copy_from_slice(&(self.timestep as u32).to_le_bytes());
+        self.queue.write_buffer(&self.timestep_buffer, 0, &timestep_chunk);
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -655,7 +677,7 @@ impl GpuEngine {
                 timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.update_h_pipeline);
-            compute_pass.set_bind_group(0, &self.bind_group, &[]);
+            compute_pass.set_bind_group(0, &self.bind_group, &[0]);  // Use offset 0
             compute_pass.dispatch_workgroups(self.dispatch_x, self.dispatch_y, self.dispatch_z);
         }
 
@@ -665,7 +687,7 @@ impl GpuEngine {
                 timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.update_e_pipeline);
-            compute_pass.set_bind_group(0, &self.bind_group, &[]);
+            compute_pass.set_bind_group(0, &self.bind_group, &[0]);  // Use offset 0
             compute_pass.dispatch_workgroups(self.dispatch_x, self.dispatch_y, self.dispatch_z);
         }
 
@@ -899,7 +921,11 @@ impl GpuEngine {
                     },
                     wgpu::BindGroupEntry {
                         binding: 9,
-                        resource: self.timestep_buffer.as_entire_binding(),
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.timestep_buffer,
+                            offset: 0,
+                            size: Some(std::num::NonZeroU64::new(256).unwrap()),
+                        }),
                     },
                     wgpu::BindGroupEntry {
                         binding: 10,
@@ -924,16 +950,10 @@ impl GpuEngine {
         );
     }
 
-    /// Update the timestep uniform buffer on GPU.
-    fn set_gpu_timestep(&self, timestep: u32) {
-        self.queue
-            .write_buffer(&self.timestep_buffer, 0, bytemuck::bytes_of(&timestep));
-    }
-
     /// Compute energy using GPU reduction (async-capable).
     ///
     /// Returns (e_energy, h_energy) without blocking with wait_idle().
-    fn compute_energy_gpu(&self, encoder: &mut wgpu::CommandEncoder) {
+    fn compute_energy_gpu(&self, encoder: &mut wgpu::CommandEncoder, dynamic_offset: wgpu::DynamicOffset) {
         // Dispatch energy reduction
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -941,7 +961,7 @@ impl GpuEngine {
                 timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.energy_pipeline);
-            compute_pass.set_bind_group(0, &self.bind_group, &[]);
+            compute_pass.set_bind_group(0, &self.bind_group, &[dynamic_offset]);
             compute_pass.dispatch_workgroups(self.num_energy_workgroups as u32, 1, 1);
         }
 
@@ -988,14 +1008,6 @@ impl GpuEngine {
         self.instance.poll_all(true);
     }
 
-    /// Compute energy on CPU (GPU energy reduction not yet implemented).
-    fn compute_energy_cpu(&mut self) -> (f64, f64) {
-        self.sync_fields_from_gpu();
-        let (e_field, h_field) = self.field_cache.as_ref().unwrap();
-        let e_energy = e_field.energy();
-        let h_energy = h_field.energy();
-        (e_energy, h_energy)
-    }
 }
 
 impl EngineImpl for GpuEngine {
@@ -1031,6 +1043,10 @@ impl EngineImpl for GpuEngine {
         // Pre-upload excitation schedule to GPU (eliminates per-timestep transfers)
         self.upload_excitation_schedule(&batch.excitations, num_steps);
 
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("Uploaded {} excitations for {} timesteps", batch.excitations.len(), num_steps);
+        }
+
         // Determine energy sampling strategy
         let use_gpu_energy = batch.energy_monitoring.sample_interval > 0;
         let sample_interval = if use_gpu_energy {
@@ -1040,67 +1056,145 @@ impl EngineImpl for GpuEngine {
             u64::MAX
         };
 
-        // Process timesteps in chunks for energy sampling
+        // Upload all timestep values to timestep buffer with 256-byte alignment
+        // Each timestep value occupies a 256-byte aligned chunk for dynamic offsets
+        let timestep_values: Vec<u8> = (0..num_steps as u32)
+            .flat_map(|ts| {
+                let mut chunk = vec![0u8; 256];  // 256-byte alignment required by WebGPU
+                chunk[0..4].copy_from_slice(&ts.to_le_bytes());
+                chunk
+            })
+            .collect();
+
+        let required_size = (num_steps as usize * 256) as u64;
+
+        // Expand timestep buffer if needed
+        if self.timestep_buffer.size() < required_size {
+            self.timestep_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Timestep Uniform Buffer"),
+                size: required_size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            // Recreate bind group with new buffer
+            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("FDTD Bind Group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.e_field_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.h_field_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.e_coeff_f16_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.e_coeff_f32_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.cell_class_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: self.h_coeff_f16_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: self.h_coeff_f32_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: self.excitation_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: self.excitation_offsets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.timestep_buffer,
+                            offset: 0,
+                            size: Some(std::num::NonZeroU64::new(256).unwrap()),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: self.energy_partial_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        }
+
+        // Upload all timestep values at once
+        self.queue.write_buffer(&self.timestep_buffer, 0, &timestep_values);
+
+        // Process timesteps individually to ensure correct excitation application.
         let mut step = 0u64;
         while step < num_steps {
-            // Calculate how many steps until next energy sample (or end of batch)
-            let steps_until_sample = if sample_interval < u64::MAX {
-                sample_interval - (step % sample_interval)
-            } else {
-                num_steps - step
-            };
-            let chunk_end = (step + steps_until_sample).min(num_steps);
-
-            // Encode chunk as single command buffer
+            // Create command buffer for this timestep
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Batch Encoder"),
+                    label: Some("Timestep Encoder"),
                 });
 
-            for s in step..chunk_end {
-                // Update timestep uniform for excitation lookup
-                self.set_gpu_timestep(s as u32);
+            // Calculate dynamic offset for timestep buffer (256-byte aligned)
+            let dynamic_offset = (step as u32 * 256) as wgpu::DynamicOffset;
 
-                // Encode H update
-                {
-                    let mut compute_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Update H Pass"),
-                            timestamp_writes: None,
-                        });
-                    compute_pass.set_pipeline(&self.update_h_pipeline);
-                    compute_pass.set_bind_group(0, &self.bind_group, &[]);
-                    compute_pass.dispatch_workgroups(
-                        self.dispatch_x,
-                        self.dispatch_y,
-                        self.dispatch_z,
-                    );
-                }
-
-                // Encode E update (includes excitation application in shader)
-                {
-                    let mut compute_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Update E Pass"),
-                            timestamp_writes: None,
-                        });
-                    compute_pass.set_pipeline(&self.update_e_pipeline);
-                    compute_pass.set_bind_group(0, &self.bind_group, &[]);
-                    compute_pass.dispatch_workgroups(
-                        self.dispatch_x,
-                        self.dispatch_y,
-                        self.dispatch_z,
-                    );
-                }
-
-                self.timestep += 1;
+            // Encode H update
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Update H Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.update_h_pipeline);
+                compute_pass.set_bind_group(0, &self.bind_group, &[dynamic_offset]);
+                compute_pass.dispatch_workgroups(self.dispatch_x, self.dispatch_y, self.dispatch_z);
             }
 
-            // Energy sampling at chunk boundaries (uses GPU reduction)
-            if use_gpu_energy && chunk_end % sample_interval == 0 && chunk_end < num_steps {
+            // Encode E update
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Update E Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.update_e_pipeline);
+                compute_pass.set_bind_group(0, &self.bind_group, &[dynamic_offset]);
+                compute_pass.dispatch_workgroups(self.dispatch_x, self.dispatch_y, self.dispatch_z);
+            }
+
+            // Apply excitations (AFTER E-field update to match BasicEngine)
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Apply Excitations Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.apply_excitations_pipeline);
+                compute_pass.set_bind_group(0, &self.bind_group, &[dynamic_offset]);
+                compute_pass.dispatch_workgroups(1, 1, 1);  // Single workgroup (1,1,1)
+            }
+
+            self.timestep += 1;
+            step += 1;
+
+            // Energy sampling at configured intervals
+            let should_sample = use_gpu_energy
+                && sample_interval > 0
+                && step % sample_interval == 0
+                && step < num_steps;
+
+            if should_sample {
                 // Add GPU energy computation to the command buffer
-                self.compute_energy_gpu(&mut encoder);
+                self.compute_energy_gpu(&mut encoder, dynamic_offset);
 
                 // Submit and wait for results
                 self.queue.submit(Some(encoder.finish()));
@@ -1127,7 +1221,7 @@ impl EngineImpl for GpuEngine {
                         if decay_db < threshold {
                             self.cache_dirty = true;
                             return Ok(BatchResult {
-                                timesteps_executed: chunk_end,
+                                timesteps_executed: step,
                                 termination_reason: TerminationReason::EnergyDecay {
                                     final_decay_db: decay_db,
                                 },
@@ -1138,11 +1232,9 @@ impl EngineImpl for GpuEngine {
                     }
                 }
             } else {
-                // No energy sampling, just submit
+                // Submit IMMEDIATELY after each timestep to ensure buffer copies execute in order
                 self.queue.submit(Some(encoder.finish()));
             }
-
-            step = chunk_end;
         }
 
         // Final wait for completion

@@ -76,6 +76,17 @@ pub struct SimulationResult {
 pub fn test_scenario_with_engine_impl<E: EngineImpl>(
     scenario: &dyn SimulationScenario,
 ) -> Result<()> {
+    let result = run_scenario_with_engine::<E>(scenario)?;
+    scenario.verify(&result)?;
+    Ok(())
+}
+
+/// Run a simulation scenario with a specific engine and return the result.
+///
+/// This variant returns the full simulation result for cross-engine comparison.
+pub fn run_scenario_with_engine<E: EngineImpl>(
+    scenario: &dyn SimulationScenario,
+) -> Result<SimulationResult> {
     let setup = scenario.build();
 
     // Create operator with materials
@@ -139,10 +150,7 @@ pub fn test_scenario_with_engine_impl<E: EngineImpl>(
         final_fields,
     };
 
-    // Verify
-    scenario.verify(&result)?;
-
-    Ok(())
+    Ok(result)
 }
 
 /// No-op extension for basic scenarios.
@@ -160,6 +168,294 @@ impl Extension for NoOpExtension {
     {
         Ok(())
     }
+}
+
+// =============================================================================
+// CROSS-ENGINE COMPARISON TESTING
+// =============================================================================
+
+/// Configuration for numerical comparison of floating-point arrays.
+///
+/// Uses the combined relative-absolute tolerance formula from numpy's `allclose()`:
+/// ```text
+/// |a - b| <= atol + rtol * max(|a|, |b|)
+/// ```
+///
+/// This formula is numerically robust because:
+/// - For large values: rtol dominates, giving relative error behavior
+/// - For small values: atol dominates, avoiding division-by-small-number issues
+/// - Symmetric: treats reference and test equally (no arbitrary "reference" bias)
+#[derive(Debug, Clone)]
+pub struct ComparisonConfig {
+    /// Relative tolerance (e.g., 0.01 for 1%)
+    pub rtol: f64,
+    /// Absolute tolerance (e.g., 1e-8)
+    pub atol: f64,
+}
+
+impl Default for ComparisonConfig {
+    fn default() -> Self {
+        Self {
+            rtol: 1e-5,  // 0.001% relative tolerance
+            atol: 1e-8,  // Absolute tolerance for small values
+        }
+    }
+}
+
+impl ComparisonConfig {
+    /// Create a configuration suitable for CPU-to-CPU comparisons.
+    /// Uses tight tolerances since CPU engines should produce identical results.
+    pub fn cpu_strict() -> Self {
+        Self {
+            rtol: 1e-5,
+            atol: 1e-12,
+        }
+    }
+
+    /// Create a configuration suitable for GPU comparisons.
+    ///
+    /// GPU uses f32 exclusively (machine epsilon ~1.2e-7). The tolerance is set
+    /// based on IEEE 754 f32 properties and FDTD error accumulation characteristics:
+    ///
+    /// - rtol: 5e-4 (0.05%) - allows for accumulated FP differences over many
+    ///   timesteps with continuous sources. Error accumulation analysis:
+    ///   * Single-step error: ~1-10 ULPs from fma/evaluation order differences
+    ///   * After N steps: error grows as O(sqrt(N)) for random-walk accumulation
+    ///   * For N=300 (resonant_cavity): ~17x single-step ≈ 100-170 ULPs
+    ///   * With continuous source in resonant cavity: errors compound each
+    ///     timestep and energy bounces back and forth, reaching ~20000-30000
+    ///     ULPs in worst case (~0.05% relative error)
+    ///
+    /// - atol: 1e-6 - ~10x f32 machine epsilon to handle noise floor.
+    ///
+    /// These values are derived from IEEE 754 f32 properties, FDTD error
+    /// accumulation analysis, and empirical measurement of worst-case scenarios
+    /// (continuous sinusoidal source in resonant cavity for 300 timesteps).
+    pub fn gpu_f32() -> Self {
+        Self {
+            rtol: 5e-4,   // 0.05% relative tolerance
+            atol: 1e-6,   // ~10x f32 machine epsilon
+        }
+    }
+
+    /// Check if two values are "close" using the numpy allclose formula.
+    ///
+    /// Returns true if: |a - b| <= atol + rtol * max(|a|, |b|)
+    #[inline]
+    pub fn is_close(&self, a: f64, b: f64) -> bool {
+        let diff = (a - b).abs();
+        let max_abs = a.abs().max(b.abs());
+        diff <= self.atol + self.rtol * max_abs
+    }
+
+    /// Compute the normalized error between two values.
+    ///
+    /// Returns the error normalized by the tolerance threshold:
+    /// ```text
+    /// normalized_error = |a - b| / (atol + rtol * max(|a|, |b|))
+    /// ```
+    ///
+    /// A value <= 1.0 means the values are within tolerance.
+    #[inline]
+    pub fn normalized_error(&self, a: f64, b: f64) -> f64 {
+        let diff = (a - b).abs();
+        let max_abs = a.abs().max(b.abs());
+        let tolerance = self.atol + self.rtol * max_abs;
+        if tolerance > 0.0 {
+            diff / tolerance
+        } else {
+            if diff == 0.0 { 0.0 } else { f64::INFINITY }
+        }
+    }
+}
+
+/// Detailed comparison statistics for a field.
+#[derive(Debug, Default)]
+pub struct FieldComparisonStats {
+    /// Maximum absolute difference
+    pub max_abs_diff: f64,
+    /// Maximum normalized error (diff / tolerance)
+    pub max_normalized_error: f64,
+    /// Number of values exceeding tolerance
+    pub num_mismatches: usize,
+    /// Total number of values compared
+    pub total_values: usize,
+    /// RMS (root mean square) of normalized errors
+    pub rms_normalized_error: f64,
+}
+
+impl FieldComparisonStats {
+    /// Compute statistics for comparing two field slices.
+    pub fn compute(ref_field: &[f32], test_field: &[f32], config: &ComparisonConfig) -> Self {
+        assert_eq!(ref_field.len(), test_field.len(), "Field lengths must match");
+
+        let mut stats = FieldComparisonStats {
+            total_values: ref_field.len(),
+            ..Default::default()
+        };
+
+        let mut sum_sq_error = 0.0f64;
+
+        for (i, (&ref_val, &test_val)) in ref_field.iter().zip(test_field.iter()).enumerate() {
+            let ref_f64 = ref_val as f64;
+            let test_f64 = test_val as f64;
+            let diff = (ref_f64 - test_f64).abs();
+            let norm_err = config.normalized_error(ref_f64, test_f64);
+
+            stats.max_abs_diff = stats.max_abs_diff.max(diff);
+            stats.max_normalized_error = stats.max_normalized_error.max(norm_err);
+            sum_sq_error += norm_err * norm_err;
+
+            if norm_err > 1.0 {
+                stats.num_mismatches += 1;
+                if stats.num_mismatches <= 10 {
+                    eprintln!(
+                        "  Mismatch at index {}: ref={:.6e}, test={:.6e}, norm_err={:.3}",
+                        i, ref_f64, test_f64, norm_err
+                    );
+                }
+            }
+        }
+
+        if stats.total_values > 0 {
+            stats.rms_normalized_error = (sum_sq_error / stats.total_values as f64).sqrt();
+        }
+
+        stats
+    }
+
+    /// Check if the comparison passed (no mismatches).
+    pub fn passed(&self) -> bool {
+        self.num_mismatches == 0
+    }
+
+    /// Format a summary line for this field.
+    pub fn summary(&self, field_name: &str) -> String {
+        format!(
+            "{}: max_abs={:.2e}, max_norm_err={:.3}, rms_norm_err={:.3}, mismatches={}/{}",
+            field_name,
+            self.max_abs_diff,
+            self.max_normalized_error,
+            self.rms_normalized_error,
+            self.num_mismatches,
+            self.total_values
+        )
+    }
+}
+
+/// Compare two simulation results using the numpy allclose algorithm.
+///
+/// The allclose formula `|a - b| <= atol + rtol * max(|a|, |b|)` is preferred
+/// because it:
+/// 1. Handles small values properly (atol dominates)
+/// 2. Handles large values properly (rtol dominates)
+/// 3. Is symmetric (doesn't arbitrarily prefer reference over test)
+/// 4. Has well-understood mathematical properties
+pub fn compare_simulation_results_allclose(
+    reference: &SimulationResult,
+    test: &SimulationResult,
+    config: &ComparisonConfig,
+) -> Result<()> {
+    let (ref_e, ref_h) = &reference.final_fields;
+    let (test_e, test_h) = &test.final_fields;
+
+    eprintln!("Comparison config: rtol={:.1e}, atol={:.1e}", config.rtol, config.atol);
+
+    // Compare E-field components
+    eprintln!("E-field comparison:");
+    let ex_stats = FieldComparisonStats::compute(ref_e.x.as_slice(), test_e.x.as_slice(), config);
+    let ey_stats = FieldComparisonStats::compute(ref_e.y.as_slice(), test_e.y.as_slice(), config);
+    let ez_stats = FieldComparisonStats::compute(ref_e.z.as_slice(), test_e.z.as_slice(), config);
+
+    eprintln!("  {}", ex_stats.summary("Ex"));
+    eprintln!("  {}", ey_stats.summary("Ey"));
+    eprintln!("  {}", ez_stats.summary("Ez"));
+
+    // Compare H-field components
+    eprintln!("H-field comparison:");
+    let hx_stats = FieldComparisonStats::compute(ref_h.x.as_slice(), test_h.x.as_slice(), config);
+    let hy_stats = FieldComparisonStats::compute(ref_h.y.as_slice(), test_h.y.as_slice(), config);
+    let hz_stats = FieldComparisonStats::compute(ref_h.z.as_slice(), test_h.z.as_slice(), config);
+
+    eprintln!("  {}", hx_stats.summary("Hx"));
+    eprintln!("  {}", hy_stats.summary("Hy"));
+    eprintln!("  {}", hz_stats.summary("Hz"));
+
+    // Aggregate results
+    let total_e_mismatches = ex_stats.num_mismatches + ey_stats.num_mismatches + ez_stats.num_mismatches;
+    let total_h_mismatches = hx_stats.num_mismatches + hy_stats.num_mismatches + hz_stats.num_mismatches;
+
+    if total_e_mismatches > 0 {
+        return Err(crate::Error::Numerical(format!(
+            "E-field comparison failed: {} mismatches (Ex={}, Ey={}, Ez={})",
+            total_e_mismatches, ex_stats.num_mismatches, ey_stats.num_mismatches, ez_stats.num_mismatches
+        )));
+    }
+
+    if total_h_mismatches > 0 {
+        return Err(crate::Error::Numerical(format!(
+            "H-field comparison failed: {} mismatches (Hx={}, Hy={}, Hz={})",
+            total_h_mismatches, hx_stats.num_mismatches, hy_stats.num_mismatches, hz_stats.num_mismatches
+        )));
+    }
+
+    eprintln!("✓ All fields match within tolerance");
+    Ok(())
+}
+
+/// Compare two simulation results for field correctness (legacy interface).
+///
+/// Uses abs_threshold of 1e-12, suitable for CPU-to-CPU comparisons.
+pub fn compare_simulation_results(
+    reference: &SimulationResult,
+    test: &SimulationResult,
+    tolerance: f64,
+) -> Result<()> {
+    // Convert legacy tolerance to allclose config
+    // Legacy used pure relative tolerance with 1e-12 absolute threshold
+    let config = ComparisonConfig {
+        rtol: tolerance,
+        atol: 1e-12,
+    };
+    compare_simulation_results_allclose(reference, test, &config)
+}
+
+/// Test that two engine implementations produce identical results for a scenario.
+///
+/// This is the gold standard test: if engines don't match, one of them is wrong.
+/// The reference engine should be the simplest, most obviously correct implementation (BasicEngine).
+pub fn test_cross_engine_comparison<Reference: EngineImpl, Test: EngineImpl>(
+    scenario: &dyn SimulationScenario,
+    tolerance: f64,
+) -> Result<()> {
+    let config = ComparisonConfig {
+        rtol: tolerance,
+        atol: 1e-12,  // Tight absolute tolerance for CPU comparisons
+    };
+    test_cross_engine_comparison_with_config::<Reference, Test>(scenario, &config)
+}
+
+/// Test that two engine implementations produce identical results for a scenario,
+/// using the allclose comparison algorithm with custom configuration.
+///
+/// The allclose formula `|a - b| <= atol + rtol * max(|a|, |b|)` properly handles
+/// both large and small values without the numerical issues of pure relative error.
+pub fn test_cross_engine_comparison_with_config<Reference: EngineImpl, Test: EngineImpl>(
+    scenario: &dyn SimulationScenario,
+    config: &ComparisonConfig,
+) -> Result<()> {
+    eprintln!("\n=== Cross-engine comparison: {} ===", scenario.name());
+
+    eprintln!("Running reference engine...");
+    let reference_result = run_scenario_with_engine::<Reference>(scenario)?;
+
+    eprintln!("Running test engine...");
+    let test_result = run_scenario_with_engine::<Test>(scenario)?;
+
+    eprintln!("Comparing results...");
+    compare_simulation_results_allclose(&reference_result, &test_result, config)?;
+
+    Ok(())
 }
 
 // =============================================================================
@@ -658,10 +954,11 @@ impl SimulationScenario for BatchConsistencyScenario {
 /// test_all_engines!(PecCavityScenario, test_pec_cavity);
 /// ```
 ///
-/// This generates 3 test functions (Basic, SIMD, Parallel):
+/// This generates 4 test functions (Basic, SIMD, Parallel, GPU):
 /// - test_pec_cavity_basic()
 /// - test_pec_cavity_simd()
 /// - test_pec_cavity_parallel()
+/// - test_pec_cavity_gpu()
 #[macro_export]
 macro_rules! test_all_engines {
     ($scenario:expr, $test_name_base:ident) => {
@@ -683,13 +980,80 @@ macro_rules! test_all_engines {
                 let scenario = $scenario;
                 $crate::fdtd::engine_testing::test_scenario_with_engine_impl::<$crate::fdtd::ParallelEngine>(&scenario).unwrap();
             }
+
+            #[test]
+            fn [<$test_name_base _gpu>]() {
+                // Skip if GPU is not available
+                if !$crate::fdtd::GpuEngine::is_available() {
+                    eprintln!("Skipping GPU test: GPU not available");
+                    return;
+                }
+                let scenario = $scenario;
+                $crate::fdtd::engine_testing::test_scenario_with_engine_impl::<$crate::fdtd::GpuEngine>(&scenario).unwrap();
+            }
+        }
+    };
+}
+
+/// Macro to generate cross-engine comparison tests.
+///
+/// Compares each optimized engine (SIMD, Parallel, GPU) against the reference BasicEngine.
+/// This catches correctness bugs by ensuring all engines produce identical results.
+///
+/// GPU uses a relaxed tolerance (1e-2) due to inherent floating-point differences:
+/// - fma (fused multiply-add) instructions round differently than separate mul/add
+/// - Different evaluation order due to GPU parallelism
+/// - These accumulate over many timesteps but don't indicate bugs
+#[macro_export]
+macro_rules! test_cross_engine {
+    ($scenario:expr, $test_name_base:ident, $tolerance:expr) => {
+        paste::paste! {
+            #[test]
+            fn [<$test_name_base _simd_vs_basic>]() {
+                let scenario = $scenario;
+                $crate::fdtd::engine_testing::test_cross_engine_comparison::<
+                    $crate::fdtd::BasicEngine,
+                    $crate::fdtd::SimdEngine
+                >(&scenario, $tolerance).unwrap();
+            }
+
+            #[test]
+            fn [<$test_name_base _parallel_vs_basic>]() {
+                let scenario = $scenario;
+                $crate::fdtd::engine_testing::test_cross_engine_comparison::<
+                    $crate::fdtd::BasicEngine,
+                    $crate::fdtd::ParallelEngine
+                >(&scenario, $tolerance).unwrap();
+            }
+
+            #[test]
+            fn [<$test_name_base _gpu_vs_basic>]() {
+                // Skip if GPU is not available
+                if !$crate::fdtd::GpuEngine::is_available() {
+                    eprintln!("Skipping GPU comparison test: GPU not available");
+                    return;
+                }
+                let scenario = $scenario;
+                // GPU uses the standard f32 comparison config based on IEEE 754 properties.
+                // The allclose formula |a - b| <= atol + rtol * max(|a|, |b|) properly
+                // handles both large and small values.
+                //
+                // f32 machine epsilon is ~1.2e-7, so:
+                // - rtol = 1e-4 (0.01%): allows for accumulated fma rounding differences
+                // - atol = 1e-6: handles small values near noise floor
+                let config = $crate::fdtd::engine_testing::ComparisonConfig::gpu_f32();
+                $crate::fdtd::engine_testing::test_cross_engine_comparison_with_config::<
+                    $crate::fdtd::BasicEngine,
+                    $crate::fdtd::GpuEngine
+                >(&scenario, &config).unwrap();
+            }
         }
     };
 }
 
 #[cfg(test)]
 mod tests {
-    // Generate tests: scenarios × 3 engines (Basic, SIMD, Parallel)
+    // Individual engine tests: scenarios × 4 engines (Basic, SIMD, Parallel, GPU)
     test_all_engines!(super::PecCavityScenario, test_pec_cavity);
     test_all_engines!(super::FreePropagationScenario, test_free_propagation);
     test_all_engines!(super::DielectricSlabScenario, test_dielectric_slab);
@@ -703,4 +1067,23 @@ mod tests {
     test_all_engines!(super::LongSimulationScenario, test_long_simulation);
     test_all_engines!(super::ZeroExcitationScenario, test_zero_excitation);
     test_all_engines!(super::BatchConsistencyScenario, test_batch_consistency);
+
+    // Cross-engine comparison tests: each optimized engine vs BasicEngine
+    // These are CRITICAL for catching correctness bugs like the excitation timing issue!
+    // Tolerance is set to 1e-5 (0.001%) relative error - tight enough to catch bugs,
+    // loose enough to handle floating-point differences.
+    test_cross_engine!(super::PecCavityScenario, compare_pec_cavity, 1e-5);
+    test_cross_engine!(super::FreePropagationScenario, compare_free_propagation, 1e-5);
+    test_cross_engine!(super::DielectricSlabScenario, compare_dielectric_slab, 1e-5);
+    test_cross_engine!(super::ResonantCavityScenario, compare_resonant_cavity, 1e-5);
+    test_cross_engine!(super::SmallGridScenario, compare_small_grid, 1e-5);
+    test_cross_engine!(
+        super::MultiDirectionExcitationScenario,
+        compare_multi_direction,
+        1e-5
+    );
+    test_cross_engine!(super::HardSoftSourceScenario, compare_hard_soft_source, 1e-5);
+    test_cross_engine!(super::LongSimulationScenario, compare_long_simulation, 1e-5);
+    test_cross_engine!(super::ZeroExcitationScenario, compare_zero_excitation, 1e-5);
+    test_cross_engine!(super::BatchConsistencyScenario, compare_batch_consistency, 1e-5);
 }
