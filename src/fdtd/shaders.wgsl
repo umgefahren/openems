@@ -3,6 +3,11 @@ override nx: u32;
 override ny: u32;
 override nz: u32;
 
+// Numerical stability constants
+const DENORMAL_THRESHOLD: f32 = 1e-30;  // Flush values below this to zero
+const FIELD_CLAMP_MAX: f32 = 1e15;      // Prevent runaway field values
+const F32_MAX_FINITE: f32 = 3.4028235e38;  // Largest finite f32
+
 // Fields: [Ex, Ey, Ez] (concatenated)
 @group(0) @binding(0) var<storage, read_write> e_field: array<f32>;
 
@@ -43,6 +48,33 @@ struct TimestepUniform {
 
 fn get_idx(x: u32, y: u32, z: u32) -> u32 {
     return x * ny * nz + y * nz + z;
+}
+
+// ============================================================================
+// Numerical Stability Functions
+// ============================================================================
+
+// Check if value is NaN (IEEE 754: NaN != NaN)
+fn is_nan(value: f32) -> bool {
+    return value != value;
+}
+
+// Check if value is infinite
+fn is_inf(value: f32) -> bool {
+    return abs(value) > F32_MAX_FINITE;
+}
+
+// Sanitize field value: clamp to prevent overflow, flush denormals to zero
+// This prevents NaN/Inf propagation and slow denormal operations
+fn sanitize_field(value: f32) -> f32 {
+    // Check for NaN or Inf first - reset to zero to prevent corruption
+    if (is_nan(value) || is_inf(value)) {
+        return 0.0;
+    }
+    // Clamp to prevent runaway values (CFL violation)
+    let clamped = clamp(value, -FIELD_CLAMP_MAX, FIELD_CLAMP_MAX);
+    // Flush denormals to zero (values too small cause slow GPU operations)
+    return select(0.0, clamped, abs(clamped) > DENORMAL_THRESHOLD);
 }
 
 struct Coeffs {
@@ -135,37 +167,27 @@ fn update_h(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Hx update: curl_x = dEz/dy - dEy/dz
         // dez_dy = Ez(i, j+1, k) - Ez(i, j, k)
         // dey_dz = Ey(i, j, k+1) - Ey(i, j, k)
-        
         let ez_curr = e_field[2u * total + idx];
-        let ez_jp1_val = select(0.0, e_field[2u * total + get_idx(i, j + 1u, k)] - ez_curr, j + 1u < ny);
-        let dez_dy = ez_jp1_val;
-
-        // Reuse Ey values from registers, but need boundary check
+        let dez_dy = select(0.0, e_field[2u * total + get_idx(i, j + 1u, k)] - ez_curr, j + 1u < ny);
         let dey_dz = select(0.0, ey_vals[u + 1u] - ey_vals[u], k + 1u < nz);
-
         let curl_x = dez_dy - dey_dz;
         let hx_idx = 0u * total + idx;
-        h_field[hx_idx] = fma(db_x, curl_x, da_x * h_field[hx_idx]);
+        h_field[hx_idx] = sanitize_field(fma(db_x, curl_x, da_x * h_field[hx_idx]));
 
         // Hy update: curl_y = dEx/dz - dEz/dx
-        // dex_dz = Ex(i, j, k+1) - Ex(i, j, k)
         let ex_curr = e_field[0u * total + idx];
-        let ex_kp1 = select(0.0, e_field[0u * total + idx + 1u] - ex_curr, k + 1u < nz);
-        let dex_dz = ex_kp1;
-        
+        let dex_dz = select(0.0, e_field[0u * total + idx + 1u] - ex_curr, k + 1u < nz);
         let dez_dx = select(0.0, e_field[2u * total + get_idx(i + 1u, j, k)] - ez_curr, i + 1u < nx);
         let curl_y = dex_dz - dez_dx;
-        
         let hy_idx = 1u * total + idx;
-        h_field[hy_idx] = fma(db_y, curl_y, da_y * h_field[hy_idx]);
+        h_field[hy_idx] = sanitize_field(fma(db_y, curl_y, da_y * h_field[hy_idx]));
 
         // Hz update: curl_z = dEy/dx - dEx/dy
         let dey_dx = select(0.0, e_field[1u * total + get_idx(i + 1u, j, k)] - ey_vals[u], i + 1u < nx);
         let dex_dy = select(0.0, e_field[0u * total + get_idx(i, j + 1u, k)] - ex_curr, j + 1u < ny);
         let curl_z = dey_dx - dex_dy;
-        
         let hz_idx = 2u * total + idx;
-        h_field[hz_idx] = fma(db_z, curl_z, da_z * h_field[hz_idx]);
+        h_field[hz_idx] = sanitize_field(fma(db_z, curl_z, da_z * h_field[hz_idx]));
     }
 }
 
@@ -222,33 +244,26 @@ fn update_e(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Ex update: curl_x = (Hz(j) - Hz(j-1)) - (Hy(k) - Hy(k-1))
         let hz_curr = h_field[2u * total + idx];
         let hz_jm1 = h_field[2u * total + get_idx(i, j - 1u, k)];
-        
         let hy_k = hy_vals[u + 1u];
         let hy_km1 = hy_vals[u];
-        
         let curl_x = (hz_curr - hz_jm1) - (hy_k - hy_km1);
-        
         let ex_idx = 0u * total + idx;
-        e_field[ex_idx] = fma(cb_x, curl_x, ca_x * e_field[ex_idx]);
+        e_field[ex_idx] = sanitize_field(fma(cb_x, curl_x, ca_x * e_field[ex_idx]));
 
         // Ey update: curl_y = (Hx(k) - Hx(k-1)) - (Hz(i) - Hz(i-1))
         let hx_curr = h_field[0u * total + idx];
         let hx_km1 = h_field[0u * total + idx - 1u]; // Safe since k>=1
         let hz_im1 = h_field[2u * total + get_idx(i - 1u, j, k)];
-        
         let curl_y = (hx_curr - hx_km1) - (hz_curr - hz_im1);
-        
         let ey_idx = 1u * total + idx;
-        e_field[ey_idx] = fma(cb_y, curl_y, ca_y * e_field[ey_idx]);
+        e_field[ey_idx] = sanitize_field(fma(cb_y, curl_y, ca_y * e_field[ey_idx]));
 
         // Ez update: curl_z = (Hy(i) - Hy(i-1)) - (Hx(j) - Hx(j-1))
         let hy_im1 = h_field[1u * total + get_idx(i - 1u, j, k)];
         let hx_jm1 = h_field[0u * total + get_idx(i, j - 1u, k)];
-        
         let curl_z = (hy_k - hy_im1) - (hx_curr - hx_jm1);
-        
         let ez_idx = 2u * total + idx;
-        e_field[ez_idx] = fma(cb_z, curl_z, ca_z * e_field[ez_idx]);
+        e_field[ez_idx] = sanitize_field(fma(cb_z, curl_z, ca_z * e_field[ez_idx]));
     }
 }
 

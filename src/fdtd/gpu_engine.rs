@@ -178,11 +178,32 @@ impl GpuEngine {
                         e_coeff.cb[2].get(i, j, k),
                     ];
 
-                    // Classify
-                    // Always use f32 (class_id = 1) for precision.
-                    // The f16 path saves memory but has only ~3 decimal digits precision,
-                    // which causes ~1e-2 relative errors compared to CPU engines.
-                    let class_id = 1u32;
+                    // Classify: Use f16 where it can accurately represent the coefficients.
+                    // f16 has ~3 decimal digits precision (machine epsilon ~9.77e-4).
+                    //
+                    // IMPORTANT: Even small coefficient errors accumulate over many timesteps.
+                    // For a 300-step simulation, a 0.01% per-step error can become ~3% total.
+                    // We use a very tight threshold (1e-5 = 0.001%) to ensure errors stay
+                    // below our allclose tolerance (rtol=5e-4) even after hundreds of steps.
+                    //
+                    // In practice, this means f16 is only used for:
+                    // - Coefficients that are exactly representable in f16 (powers of 2, etc.)
+                    // - Ca = 1.0 (lossless vacuum) which is exact in f16
+                    let class_id = if supports_f16 {
+                        let coeffs = [ca[0], ca[1], ca[2], cb[0], cb[1], cb[2]];
+                        let needs_f32 = coeffs.iter().any(|&v| {
+                            if v == 0.0 {
+                                false // Zero is exact in both formats
+                            } else {
+                                let v_f16 = f16::from_f32(v).to_f32();
+                                let rel_err = ((v - v_f16) / v).abs();
+                                rel_err > 1e-5 // 0.001% threshold - very tight for long simulations
+                            }
+                        });
+                        if needs_f32 { 1u32 } else { 0u32 }
+                    } else {
+                        1u32 // No f16 support, always use f32
+                    };
                     cell_class_data.push(class_id);
 
                     // Pack data
