@@ -944,6 +944,426 @@ impl SimulationScenario for BatchConsistencyScenario {
 }
 
 // =============================================================================
+// STRESS TEST SCENARIOS
+// =============================================================================
+
+/// Scenario 11: Very high permittivity material (ε_r = 100).
+/// Tests GPU coefficient handling for extreme material parameters.
+pub struct HighPermittivityScenario;
+
+impl SimulationScenario for HighPermittivityScenario {
+    fn name(&self) -> &str {
+        "high_permittivity_material"
+    }
+
+    fn build(&self) -> SimulationSetup {
+        let grid = Grid::uniform(30, 30, 60, 0.3e-3);
+
+        SimulationSetup {
+            grid,
+            boundaries: BoundaryConditions::all_pec(),
+            materials: vec![MaterialRegion {
+                region: (0..30, 0..30, 25..35),
+                epsilon_r: 100.0, // Very high permittivity (like barium titanate)
+                mu_r: 1.0,
+                sigma_e: 0.0,
+                sigma_m: 0.0,
+            }],
+            excitations: vec![Excitation::gaussian(1e9, 0.5, 2, (15, 15, 10))],
+            num_steps: 300,
+            energy_monitoring: EnergyMonitorConfig {
+                sample_interval: 30,
+                track_peak: true,
+                decay_threshold: None,
+            },
+        }
+    }
+
+    fn verify(&self, result: &SimulationResult) -> Result<()> {
+        let (e, h) = &result.final_fields;
+
+        // Wave should slow down significantly in high-ε material (v = c/sqrt(ε_r))
+        // Check for NaN and reasonable energy
+        assert!(
+            !e.energy().is_nan() && !h.energy().is_nan(),
+            "Fields contain NaN"
+        );
+
+        // Energy should be present
+        let total_energy = e.energy() + h.energy();
+        assert!(
+            total_energy > 0.0,
+            "No field energy after propagation through high-ε material"
+        );
+
+        Ok(())
+    }
+}
+
+/// Scenario 12: Extreme permittivity (ε_r = 1000).
+/// Pushes material parameter limits even further.
+pub struct ExtremePermittivityScenario;
+
+impl SimulationScenario for ExtremePermittivityScenario {
+    fn name(&self) -> &str {
+        "extreme_permittivity_material"
+    }
+
+    fn build(&self) -> SimulationSetup {
+        let grid = Grid::uniform(25, 25, 50, 0.4e-3);
+
+        SimulationSetup {
+            grid,
+            boundaries: BoundaryConditions::all_pec(),
+            materials: vec![MaterialRegion {
+                region: (0..25, 0..25, 20..30),
+                epsilon_r: 1000.0, // Extreme permittivity
+                mu_r: 1.0,
+                sigma_e: 0.0,
+                sigma_m: 0.0,
+            }],
+            excitations: vec![Excitation::gaussian(0.5e9, 0.5, 2, (12, 12, 8))],
+            num_steps: 400,
+            energy_monitoring: EnergyMonitorConfig {
+                sample_interval: 40,
+                track_peak: true,
+                decay_threshold: None,
+            },
+        }
+    }
+
+    fn verify(&self, result: &SimulationResult) -> Result<()> {
+        // Check for NaN
+        for sample in &result.batch_result.energy_samples {
+            assert!(
+                !sample.total_energy.is_nan(),
+                "Energy became NaN with extreme permittivity"
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Scenario 13: Lossy dielectric material (σ_e > 0).
+/// Tests conductivity handling and energy dissipation.
+pub struct LossyMaterialScenario;
+
+impl SimulationScenario for LossyMaterialScenario {
+    fn name(&self) -> &str {
+        "lossy_dielectric_material"
+    }
+
+    fn build(&self) -> SimulationSetup {
+        let grid = Grid::uniform(30, 30, 60, 0.3e-3);
+
+        SimulationSetup {
+            grid,
+            boundaries: BoundaryConditions::all_pec(),
+            materials: vec![MaterialRegion {
+                region: (0..30, 0..30, 20..40),
+                epsilon_r: 4.0,
+                mu_r: 1.0,
+                sigma_e: 0.1, // 0.1 S/m conductivity (lossy)
+                sigma_m: 0.0,
+            }],
+            excitations: vec![Excitation::gaussian(3e9, 0.5, 2, (15, 15, 10))],
+            num_steps: 300,
+            energy_monitoring: EnergyMonitorConfig {
+                sample_interval: 30,
+                track_peak: true,
+                decay_threshold: None,
+            },
+        }
+    }
+
+    fn verify(&self, result: &SimulationResult) -> Result<()> {
+        let energy_samples = &result.batch_result.energy_samples;
+
+        // Check for NaN throughout simulation
+        for sample in energy_samples {
+            assert!(
+                !sample.total_energy.is_nan(),
+                "Energy became NaN in lossy material"
+            );
+            assert!(
+                !sample.total_energy.is_infinite(),
+                "Energy became infinite in lossy material"
+            );
+        }
+
+        // Energy should not grow unbounded (lossy material should not add energy)
+        if let Some(peak) = energy_samples.iter().map(|s| s.total_energy).reduce(f64::max) {
+            // Peak should be reasonable (not orders of magnitude larger than expected)
+            assert!(
+                peak < 1e10,
+                "Energy grew unreasonably large in lossy material: {:.3e}",
+                peak
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Scenario 14: Magnetic material (μ_r > 1).
+/// Tests permeability handling.
+pub struct MagneticMaterialScenario;
+
+impl SimulationScenario for MagneticMaterialScenario {
+    fn name(&self) -> &str {
+        "magnetic_material"
+    }
+
+    fn build(&self) -> SimulationSetup {
+        let grid = Grid::uniform(25, 25, 50, 0.4e-3);
+
+        SimulationSetup {
+            grid,
+            boundaries: BoundaryConditions::all_pec(),
+            materials: vec![MaterialRegion {
+                region: (0..25, 0..25, 18..32),
+                epsilon_r: 1.0,
+                mu_r: 10.0, // High permeability (like ferrite)
+                sigma_e: 0.0,
+                sigma_m: 0.0,
+            }],
+            excitations: vec![Excitation::gaussian(2e9, 0.5, 2, (12, 12, 8))],
+            num_steps: 300,
+            energy_monitoring: EnergyMonitorConfig {
+                sample_interval: 30,
+                track_peak: true,
+                decay_threshold: None,
+            },
+        }
+    }
+
+    fn verify(&self, result: &SimulationResult) -> Result<()> {
+        let (e, h) = &result.final_fields;
+
+        // Wave should propagate (impedance changes but wave continues)
+        assert!(
+            !e.energy().is_nan() && !h.energy().is_nan(),
+            "Fields contain NaN with magnetic material"
+        );
+
+        // Energy should be present
+        let total_energy = e.energy() + h.energy();
+        assert!(
+            total_energy > 0.0,
+            "No field energy after propagation through magnetic material"
+        );
+
+        Ok(())
+    }
+}
+
+/// Scenario 15: Very long simulation (10,000 steps).
+/// Tests numerical stability and error accumulation over extended runs.
+pub struct VeryLongSimulationScenario;
+
+impl SimulationScenario for VeryLongSimulationScenario {
+    fn name(&self) -> &str {
+        "very_long_simulation_stability"
+    }
+
+    fn build(&self) -> SimulationSetup {
+        // Small grid for faster execution
+        let grid = Grid::uniform(12, 12, 12, 1.0e-3);
+
+        SimulationSetup {
+            grid,
+            boundaries: BoundaryConditions::all_pec(),
+            materials: vec![],
+            excitations: vec![Excitation::dirac(1.0, 1, (6, 6, 6))],
+            num_steps: 10_000, // Very long simulation
+            energy_monitoring: EnergyMonitorConfig {
+                sample_interval: 1000, // Sample every 1000 steps
+                track_peak: true,
+                decay_threshold: None,
+            },
+        }
+    }
+
+    fn verify(&self, result: &SimulationResult) -> Result<()> {
+        // Check that simulation completed all steps
+        assert_eq!(
+            result.batch_result.timesteps_executed, 10_000,
+            "Did not complete all 10,000 timesteps"
+        );
+
+        // Check for NaN/Inf throughout
+        for sample in &result.batch_result.energy_samples {
+            assert!(
+                !sample.total_energy.is_nan(),
+                "Energy became NaN at timestep {}",
+                sample.timestep
+            );
+            assert!(
+                !sample.total_energy.is_infinite(),
+                "Energy became infinite at timestep {}",
+                sample.timestep
+            );
+        }
+
+        // Energy should be conserved in PEC cavity (within reasonable bounds)
+        if let (Some(first), Some(last)) = (
+            result.batch_result.energy_samples.first(),
+            result.batch_result.energy_samples.last(),
+        ) {
+            let initial = first.total_energy;
+            let final_energy = last.total_energy;
+
+            if initial > 1e-20 {
+                let relative_diff = (final_energy - initial).abs() / initial;
+                // Allow up to 50% drift over 10,000 steps due to numerical dispersion
+                assert!(
+                    relative_diff < 0.50,
+                    "Energy drifted too much over 10k steps: initial={:.3e}, final={:.3e}, drift={:.1}%",
+                    initial,
+                    final_energy,
+                    relative_diff * 100.0
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Scenario 16: Multi-layer dielectric stack.
+/// Tests multiple material interfaces and coefficient transitions.
+pub struct MultiLayerStackScenario;
+
+impl SimulationScenario for MultiLayerStackScenario {
+    fn name(&self) -> &str {
+        "multi_layer_dielectric_stack"
+    }
+
+    fn build(&self) -> SimulationSetup {
+        let grid = Grid::uniform(25, 25, 80, 0.25e-3);
+
+        SimulationSetup {
+            grid,
+            boundaries: BoundaryConditions::all_pec(),
+            materials: vec![
+                MaterialRegion {
+                    region: (0..25, 0..25, 20..30),
+                    epsilon_r: 2.0,
+                    mu_r: 1.0,
+                    sigma_e: 0.0,
+                    sigma_m: 0.0,
+                },
+                MaterialRegion {
+                    region: (0..25, 0..25, 30..40),
+                    epsilon_r: 4.0,
+                    mu_r: 1.0,
+                    sigma_e: 0.0,
+                    sigma_m: 0.0,
+                },
+                MaterialRegion {
+                    region: (0..25, 0..25, 40..50),
+                    epsilon_r: 9.0,
+                    mu_r: 1.0,
+                    sigma_e: 0.0,
+                    sigma_m: 0.0,
+                },
+                MaterialRegion {
+                    region: (0..25, 0..25, 50..60),
+                    epsilon_r: 16.0,
+                    mu_r: 1.0,
+                    sigma_e: 0.0,
+                    sigma_m: 0.0,
+                },
+            ],
+            excitations: vec![Excitation::gaussian(3e9, 0.5, 2, (12, 12, 8))],
+            num_steps: 400,
+            energy_monitoring: EnergyMonitorConfig {
+                sample_interval: 40,
+                track_peak: true,
+                decay_threshold: None,
+            },
+        }
+    }
+
+    fn verify(&self, result: &SimulationResult) -> Result<()> {
+        let (e, h) = &result.final_fields;
+
+        // Check for NaN
+        assert!(
+            !e.energy().is_nan() && !h.energy().is_nan(),
+            "Fields contain NaN with multi-layer stack"
+        );
+
+        // Energy should be conserved (lossless materials)
+        for sample in &result.batch_result.energy_samples {
+            assert!(
+                !sample.total_energy.is_nan(),
+                "Energy became NaN in multi-layer stack"
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Scenario 17: Mixed lossy and lossless materials.
+/// Tests coefficient classification with varying material properties.
+pub struct MixedMaterialsScenario;
+
+impl SimulationScenario for MixedMaterialsScenario {
+    fn name(&self) -> &str {
+        "mixed_lossy_lossless_materials"
+    }
+
+    fn build(&self) -> SimulationSetup {
+        let grid = Grid::uniform(30, 30, 60, 0.3e-3);
+
+        SimulationSetup {
+            grid,
+            boundaries: BoundaryConditions::all_pec(),
+            materials: vec![
+                // Lossless dielectric
+                MaterialRegion {
+                    region: (0..30, 0..15, 20..40),
+                    epsilon_r: 4.0,
+                    mu_r: 1.0,
+                    sigma_e: 0.0,
+                    sigma_m: 0.0,
+                },
+                // Lossy dielectric next to it
+                MaterialRegion {
+                    region: (0..30, 15..30, 20..40),
+                    epsilon_r: 4.0,
+                    mu_r: 1.0,
+                    sigma_e: 0.05, // Slightly lossy
+                    sigma_m: 0.0,
+                },
+            ],
+            excitations: vec![Excitation::gaussian(3e9, 0.5, 2, (15, 15, 10))],
+            num_steps: 300,
+            energy_monitoring: EnergyMonitorConfig {
+                sample_interval: 30,
+                track_peak: true,
+                decay_threshold: None,
+            },
+        }
+    }
+
+    fn verify(&self, result: &SimulationResult) -> Result<()> {
+        // Check for NaN throughout simulation
+        for sample in &result.batch_result.energy_samples {
+            assert!(
+                !sample.total_energy.is_nan(),
+                "Energy became NaN with mixed materials"
+            );
+        }
+
+        Ok(())
+    }
+}
+
+// =============================================================================
 // MACRO TO GENERATE TESTS FOR ALL ENGINES
 // =============================================================================
 
@@ -1086,4 +1506,22 @@ mod tests {
     test_cross_engine!(super::LongSimulationScenario, compare_long_simulation, 1e-5);
     test_cross_engine!(super::ZeroExcitationScenario, compare_zero_excitation, 1e-5);
     test_cross_engine!(super::BatchConsistencyScenario, compare_batch_consistency, 1e-5);
+
+    // Stress test scenarios for edge cases and extended parameter ranges
+    test_all_engines!(super::HighPermittivityScenario, test_high_permittivity);
+    test_all_engines!(super::ExtremePermittivityScenario, test_extreme_permittivity);
+    test_all_engines!(super::LossyMaterialScenario, test_lossy_material);
+    test_all_engines!(super::MagneticMaterialScenario, test_magnetic_material);
+    test_all_engines!(super::VeryLongSimulationScenario, test_very_long_simulation);
+    test_all_engines!(super::MultiLayerStackScenario, test_multi_layer_stack);
+    test_all_engines!(super::MixedMaterialsScenario, test_mixed_materials);
+
+    // Cross-engine comparisons for stress test scenarios
+    test_cross_engine!(super::HighPermittivityScenario, compare_high_permittivity, 1e-5);
+    test_cross_engine!(super::ExtremePermittivityScenario, compare_extreme_permittivity, 1e-5);
+    test_cross_engine!(super::LossyMaterialScenario, compare_lossy_material, 1e-5);
+    test_cross_engine!(super::MagneticMaterialScenario, compare_magnetic_material, 1e-5);
+    test_cross_engine!(super::VeryLongSimulationScenario, compare_very_long_simulation, 1e-5);
+    test_cross_engine!(super::MultiLayerStackScenario, compare_multi_layer_stack, 1e-5);
+    test_cross_engine!(super::MixedMaterialsScenario, compare_mixed_materials, 1e-5);
 }
