@@ -1,20 +1,34 @@
 //! Extension trait for batching-capable FDTD extensions.
 //!
 //! This module provides a generic extension system that works across all
-//! engine types (CPU and GPU) without requiring trait objects. Extensions
-//! provide data that engines can query and use as appropriate.
+//! engine types (CPU and GPU). Extensions hook into the FDTD update cycle
+//! at specific points to modify field values.
+//!
+//! # FDTD Update Cycle
+//!
+//! The standard FDTD update cycle is:
+//! 1. `pre_update_h` - Before H-field update (e.g., PML flux swap)
+//! 2. H-field update: H = Da*H + Db*curl(E)
+//! 3. `post_update_h` - After H-field update (e.g., PML correction)
+//! 4. `pre_update_e` - Before E-field update (e.g., PML flux swap)
+//! 5. E-field update: E = Ca*E + Cb*curl(H)
+//! 6. `post_update_e` - After E-field update (e.g., dispersive material ADE, PML correction)
+//! 7. Apply excitations
+//!
+//! # GPU Support
+//!
+//! For GPU engines, extensions can either:
+//! - Provide `gpu_data()` with WGSL shader code that gets compiled into the main shader
+//! - Fall back to CPU-side processing (engine syncs fields to CPU, applies extension, syncs back)
 
+use crate::arrays::VectorField3D;
 use crate::Result;
 
 /// Core extension trait for FDTD simulations.
 ///
-/// Extensions provide data and functionality that engines can incorporate
-/// into their execution. The trait is designed to be engine-agnostic:
-/// - CPU engines call apply_step() for each timestep
-/// - GPU engines query gpu_data() to compile shaders once per batch
-///
-/// # Design Philosophy
-/// Extensions provide "what" (data, shader code), engines decide "how" (execution strategy).
+/// Extensions hook into the FDTD update cycle to modify field values.
+/// Each hook has a default no-op implementation, so extensions only need
+/// to implement the hooks they require.
 pub trait Extension: Sized + Send {
     /// Extension name for logging and debugging.
     fn name(&self) -> &str;
@@ -25,30 +39,12 @@ pub trait Extension: Sized + Send {
     /// - Initialize internal state
     /// - Validate configuration
     /// - Allocate temporary buffers
-    ///
-    /// # Type Parameters
-    /// * `E` - Engine implementation type
     fn pre_batch<E>(&mut self, _engine: &mut E) -> Result<()>
     where
         E: crate::fdtd::EngineImpl,
     {
-        Ok(()) // Default: no-op
+        Ok(())
     }
-
-    /// Apply extension for a single timestep.
-    ///
-    /// Called by CPU engines for each timestep. GPU engines typically
-    /// don't call this (they compile extensions into shaders instead).
-    ///
-    /// # Type Parameters
-    /// * `E` - Engine implementation type
-    ///
-    /// # Arguments
-    /// * `engine` - Mutable reference to engine (for field access)
-    /// * `step` - Current timestep number
-    fn apply_step<E>(&mut self, engine: &mut E, step: u64) -> Result<()>
-    where
-        E: crate::fdtd::EngineImpl;
 
     /// Post-batch cleanup hook.
     ///
@@ -56,14 +52,84 @@ pub trait Extension: Sized + Send {
     /// - Write output data
     /// - Deallocate temporary buffers
     /// - Finalize internal state
-    ///
-    /// # Type Parameters
-    /// * `E` - Engine implementation type
     fn post_batch<E>(&mut self, _engine: &mut E) -> Result<()>
     where
         E: crate::fdtd::EngineImpl,
     {
-        Ok(()) // Default: no-op
+        Ok(())
+    }
+
+    /// Pre-H-update hook.
+    ///
+    /// Called before the H-field update. Used by PML to swap fields with flux
+    /// and compute intermediate values.
+    ///
+    /// # Arguments
+    /// * `h_field` - Mutable reference to H-field (can be modified)
+    /// * `e_field` - Reference to E-field (read-only)
+    /// * `step` - Current timestep number
+    fn pre_update_h(
+        &mut self,
+        _h_field: &mut VectorField3D,
+        _e_field: &VectorField3D,
+        _step: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Post-H-update hook.
+    ///
+    /// Called after the H-field update. Used by PML to complete the
+    /// split-field correction.
+    ///
+    /// # Arguments
+    /// * `h_field` - Mutable reference to H-field (can be modified)
+    /// * `e_field` - Reference to E-field (read-only)
+    /// * `step` - Current timestep number
+    fn post_update_h(
+        &mut self,
+        _h_field: &mut VectorField3D,
+        _e_field: &VectorField3D,
+        _step: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Pre-E-update hook.
+    ///
+    /// Called before the E-field update. Used by PML to swap fields with flux
+    /// and compute intermediate values.
+    ///
+    /// # Arguments
+    /// * `e_field` - Mutable reference to E-field (can be modified)
+    /// * `h_field` - Reference to H-field (read-only)
+    /// * `step` - Current timestep number
+    fn pre_update_e(
+        &mut self,
+        _e_field: &mut VectorField3D,
+        _h_field: &VectorField3D,
+        _step: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Post-E-update hook.
+    ///
+    /// Called after the E-field update. Used by:
+    /// - PML to complete the split-field correction
+    /// - Dispersive materials (Lorentz/Drude/Debye) for ADE update
+    ///
+    /// # Arguments
+    /// * `e_field` - Mutable reference to E-field (can be modified)
+    /// * `h_field` - Reference to H-field (read-only)
+    /// * `step` - Current timestep number
+    fn post_update_e(
+        &mut self,
+        _e_field: &mut VectorField3D,
+        _h_field: &VectorField3D,
+        _step: u64,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Check for early termination.
@@ -77,7 +143,8 @@ pub trait Extension: Sized + Send {
     /// Provide GPU-specific data for shader compilation.
     ///
     /// GPU engines query this method to get shader code and buffer data.
-    /// Return None if this extension doesn't support GPU execution.
+    /// Return None if this extension doesn't support GPU execution
+    /// (the engine will fall back to CPU-side processing).
     fn gpu_data(&self) -> Option<GpuExtensionData> {
         None
     }
@@ -89,6 +156,14 @@ pub trait Extension: Sized + Send {
     fn cpu_data(&self) -> Option<CpuExtensionData> {
         None
     }
+
+    /// Check if this extension requires CPU fallback on GPU.
+    ///
+    /// Returns true if the extension needs CPU-side processing even when
+    /// running on GPU (i.e., gpu_data() returns None or is incomplete).
+    fn requires_cpu_fallback(&self) -> bool {
+        self.gpu_data().is_none()
+    }
 }
 
 /// Data that GPU extensions provide for shader compilation.
@@ -97,7 +172,11 @@ pub struct GpuExtensionData {
     /// WGSL shader code to inject into the main shader.
     ///
     /// This should define functions that will be called at appropriate
-    /// points in the FDTD update (e.g., apply_pml_e, apply_pml_h).
+    /// points in the FDTD update:
+    /// - `extension_pre_update_h(pos: vec3<u32>)` - before H update
+    /// - `extension_post_update_h(pos: vec3<u32>)` - after H update
+    /// - `extension_pre_update_e(pos: vec3<u32>)` - before E update
+    /// - `extension_post_update_e(pos: vec3<u32>)` - after E update
     pub shader_code: String,
 
     /// Buffer descriptors for GPU data upload.
@@ -128,21 +207,15 @@ pub struct GpuBufferDescriptor {
 pub struct CpuExtensionData {
     /// Pre-computed coefficient arrays.
     pub coefficients: Option<Vec<f32>>,
-    // Can be extended with other CPU-specific metadata
 }
 
 /// Heterogeneous extension enum for storing multiple extension types.
 ///
 /// Use this when you need to store extensions of different concrete types
-/// in the same collection. The enum uses macro-based dispatch to forward
-/// method calls to the appropriate implementation.
-///
-/// NOTE: Individual extension variants should be added here once they
-/// implement the Extension trait.
+/// in the same collection.
 #[derive(Debug)]
 pub enum AnyExtension {
-    /// Placeholder variant - individual extensions will be added as they're ported
-    /// to the new Extension trait
+    /// Placeholder variant
     Placeholder(std::marker::PhantomData<()>),
 }
 
@@ -151,13 +224,6 @@ impl Extension for AnyExtension {
         match self {
             AnyExtension::Placeholder(_) => "placeholder",
         }
-    }
-
-    fn apply_step<E>(&mut self, _engine: &mut E, _step: u64) -> Result<()>
-    where
-        E: crate::fdtd::EngineImpl,
-    {
-        Ok(())
     }
 }
 
@@ -168,7 +234,10 @@ mod tests {
     // Mock extension for testing
     struct MockExtension {
         name: String,
-        apply_count: usize,
+        pre_h_count: usize,
+        post_h_count: usize,
+        pre_e_count: usize,
+        post_e_count: usize,
     }
 
     impl Extension for MockExtension {
@@ -176,11 +245,43 @@ mod tests {
             &self.name
         }
 
-        fn apply_step<E>(&mut self, _engine: &mut E, _step: u64) -> Result<()>
-        where
-            E: crate::fdtd::EngineImpl,
-        {
-            self.apply_count += 1;
+        fn pre_update_h(
+            &mut self,
+            _h_field: &mut VectorField3D,
+            _e_field: &VectorField3D,
+            _step: u64,
+        ) -> Result<()> {
+            self.pre_h_count += 1;
+            Ok(())
+        }
+
+        fn post_update_h(
+            &mut self,
+            _h_field: &mut VectorField3D,
+            _e_field: &VectorField3D,
+            _step: u64,
+        ) -> Result<()> {
+            self.post_h_count += 1;
+            Ok(())
+        }
+
+        fn pre_update_e(
+            &mut self,
+            _e_field: &mut VectorField3D,
+            _h_field: &VectorField3D,
+            _step: u64,
+        ) -> Result<()> {
+            self.pre_e_count += 1;
+            Ok(())
+        }
+
+        fn post_update_e(
+            &mut self,
+            _e_field: &mut VectorField3D,
+            _h_field: &VectorField3D,
+            _step: u64,
+        ) -> Result<()> {
+            self.post_e_count += 1;
             Ok(())
         }
     }
@@ -189,7 +290,10 @@ mod tests {
     fn test_extension_trait_name() {
         let ext = MockExtension {
             name: "TestExt".to_string(),
-            apply_count: 0,
+            pre_h_count: 0,
+            post_h_count: 0,
+            pre_e_count: 0,
+            post_e_count: 0,
         };
         assert_eq!(ext.name(), "TestExt");
     }
@@ -231,7 +335,10 @@ mod tests {
 
         let mut ext = MockExtension {
             name: "Test".to_string(),
-            apply_count: 0,
+            pre_h_count: 0,
+            post_h_count: 0,
+            pre_e_count: 0,
+            post_e_count: 0,
         };
         let mut engine = TestEngine;
 
@@ -247,5 +354,8 @@ mod tests {
 
         // Default cpu_data returns None
         assert!(ext.cpu_data().is_none());
+
+        // requires_cpu_fallback should be true when gpu_data is None
+        assert!(ext.requires_cpu_fallback());
     }
 }

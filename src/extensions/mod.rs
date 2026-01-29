@@ -2,6 +2,8 @@
 //!
 //! This module provides extensions to the base FDTD engine for:
 //! - Perfectly Matched Layer (PML) absorbing boundaries
+//!   - CPML: Convolutional PML (recommended, modular)
+//!   - UPML: Uniaxial PML (legacy, requires operator modification)
 //! - Mur's absorbing boundary condition (domain boundaries)
 //! - Local absorbing boundary condition (arbitrary sheet primitives)
 //! - Dispersive materials (Lorentz, Debye, Drude)
@@ -11,6 +13,7 @@
 //! - Conducting sheet model
 
 mod conducting_sheet;
+mod cpml;
 mod dispersive;
 mod extension_trait;
 mod local_absorbing_bc;
@@ -25,7 +28,10 @@ pub use extension_trait::{
     AnyExtension, CpuExtensionData, Extension, GpuBufferDescriptor, GpuExtensionData,
 };
 
-// PML exports
+// CPML exports (Convolutional PML - recommended)
+pub use cpml::{Cpml, CpmlBoundaries};
+
+// UPML exports (legacy - requires operator modification, currently broken)
 pub use pml::{Pml, PmlBoundaries, PmlBoundary, PmlConfig, Upml};
 
 // Mur ABC exports (domain boundaries)
